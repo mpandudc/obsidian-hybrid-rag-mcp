@@ -46,9 +46,14 @@ def get_rerank_model() -> TextCrossEncoder:
 
 
 def get_db(db_path_str: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path_str)
+    p = Path(db_path_str).expanduser().resolve()
+    if not p.exists():
+        raise FileNotFoundError(f"Vault index database not found at {p}")
+    # Open in URI read-only mode to avoid write locks and ensure safe concurrent reads
+    conn = sqlite3.connect(f"file:{p}?mode=ro", uri=True)
     conn.enable_load_extension(True)
     sqlite_vec.load(conn)
+    conn.enable_load_extension(False)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -255,7 +260,44 @@ def sync_vault() -> Dict[str, Any]:
 
 
 def main():
-    mcp.run()
+    import argparse
+    import sys
+
+    parser = argparse.ArgumentParser(description="Obsidian Hybrid RAG FastMCP Server")
+    parser.add_argument(
+        "--transport",
+        default=os.getenv("MCP_TRANSPORT", "stdio"),
+        choices=["stdio", "sse", "http", "streamable-http"],
+        help="MCP transport protocol (default: stdio)",
+    )
+    parser.add_argument(
+        "--host",
+        default=os.getenv("MCP_HOST", "127.0.0.1"),
+        help="Host for HTTP/SSE daemon (default: 127.0.0.1)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=int(os.getenv("MCP_PORT", "8765")),
+        help="Port for HTTP/SSE daemon (default: 8765)",
+    )
+    parser.add_argument(
+        "--preload",
+        action="store_true",
+        help="Preload BGE-M3 and Jina Reranker models into RAM at startup",
+    )
+    args = parser.parse_args()
+
+    if args.preload:
+        print("[obsidian-hybrid-rag] Pre-warming BGE-M3 and Jina Reranker models...", file=sys.stderr)
+        get_embed_model()
+        get_rerank_model()
+        print("[obsidian-hybrid-rag] Models pre-warmed successfully.", file=sys.stderr)
+
+    if args.transport in {"sse", "http", "streamable-http"}:
+        mcp.run(transport=args.transport, host=args.host, port=args.port)
+    else:
+        mcp.run(transport="stdio")
 
 
 if __name__ == "__main__":

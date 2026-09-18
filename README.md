@@ -168,8 +168,38 @@ On Linux: `~/.config/Claude/claude_desktop_config.json`
 
 ### Hermes Agent CLI / Ecosystem
 
+**Standard Stdio:**
 ```bash
 hermes mcp add vault --command "/path/to/obsidian-hybrid-rag-mcp/.venv/bin/python -m src.server"
+```
+
+**Shared SSE Daemon Mode (Recommended for Multi-Agent setups):**
+Run as a background daemon or systemd service to keep models pre-warmed and share a single ~2.1 GB RAM footprint across multiple profiles or sessions:
+```bash
+# Start daemon listening on SSE
+vault-mcp --transport sse --host 127.0.0.1 --port 8765 --preload
+```
+
+Register with Hermes:
+```bash
+hermes config set mcp_servers.vault.url http://127.0.0.1:8765/sse
+hermes config set mcp_servers.vault.transport sse
+```
+
+Or configure via `systemd` user service (`~/.config/systemd/user/vault-mcp.service`):
+```ini
+[Unit]
+Description=Obsidian Hybrid RAG FastMCP Daemon (SSE)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/path/to/.venv/bin/python -m src.server --transport sse --host 127.0.0.1 --port 8765 --preload
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
 ```
 
 ---

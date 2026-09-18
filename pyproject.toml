@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "obsidian-hybrid-rag-mcp"
-version = "1.0.0"
+version = "1.1.0"
 description = "Production-grade Local Hybrid RAG MCP Server for Obsidian Vaults using SOTA BAAI/bge-m3 & Jina Reranker v2"
 readme = "README.md"
 requires-python = ">=3.10"
