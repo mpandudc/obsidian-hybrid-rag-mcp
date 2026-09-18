@@ -1,0 +1,262 @@
+"""
+FastMCP Stdio Server for Obsidian Hybrid RAG.
+Features Two-Stage Retrieval: FTS5 BM25 + BGE-M3 Dense Vectors + Jina Reranker v2 Cross-Encoder.
+"""
+
+from __future__ import annotations
+import os
+import sqlite3
+import struct
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import sqlite_vec
+import torch
+from fastembed.rerank.cross_encoder import TextCrossEncoder
+from fastmcp import FastMCP
+from sentence_transformers import SentenceTransformer
+
+from src.indexer import build_index
+
+DEFAULT_VAULT_PATH = os.getenv("VAULT_PATH", str(Path.home() / "vaults" / "pandu-second-brain"))
+DEFAULT_DB_PATH = os.getenv("INDEX_DB_PATH", str(Path.home() / ".hermes" / "vault-index.db"))
+EMBED_MODEL_NAME = "BAAI/bge-m3"
+RERANK_MODEL_NAME = "jinaai/jina-reranker-v2-base-multilingual"
+
+mcp = FastMCP("obsidian-hybrid-rag")
+
+# Lazy model singletons
+_EMBED_MODEL: Optional[SentenceTransformer] = None
+_RERANK_MODEL: Optional[TextCrossEncoder] = None
+
+
+def get_embed_model() -> SentenceTransformer:
+    global _EMBED_MODEL
+    if _EMBED_MODEL is None:
+        torch.set_num_threads(4)
+        _EMBED_MODEL = SentenceTransformer(EMBED_MODEL_NAME, device="cpu")
+    return _EMBED_MODEL
+
+
+def get_rerank_model() -> TextCrossEncoder:
+    global _RERANK_MODEL
+    if _RERANK_MODEL is None:
+        _RERANK_MODEL = TextCrossEncoder(model_name=RERANK_MODEL_NAME, threads=2)
+    return _RERANK_MODEL
+
+
+def get_db(db_path_str: str) -> sqlite3.Connection:
+    conn = sqlite3.connect(db_path_str)
+    conn.enable_load_extension(True)
+    sqlite_vec.load(conn)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def serialize_f32(vec: List[float]) -> bytes:
+    return struct.pack(f"{len(vec)}f", *vec)
+
+
+@mcp.tool()
+def search_vault(
+    query: str,
+    top_k: int = 5,
+    heading_filter: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Search your Obsidian knowledge base using state-of-the-art Hybrid RAG.
+    Combines SQLite FTS5 (BM25 lexical), BAAI/bge-m3 (1024-dim dense semantic vector),
+    Reciprocal Rank Fusion (RRF), and Jina Reranker v2 Cross-Encoder scoring.
+
+    Args:
+        query: Natural language question or search phrase
+        top_k: Number of highest-ranking passages to return (default 5)
+        heading_filter: Optional substring filter for document section headers
+    """
+    db_path = Path(DEFAULT_DB_PATH).expanduser().resolve()
+    if not db_path.exists():
+        return [{"error": f"Database file not found at {db_path}. Please run indexer first."}]
+
+    conn = get_db(str(db_path))
+
+    # Stage 1A: Lexical search via SQLite FTS5 (BM25)
+    fts_results: List[Dict[str, Any]] = []
+    try:
+        # Sanitize query for FTS5 syntax
+        clean_q = "".join(c if c.isalnum() or c.isspace() else " " for c in query).strip()
+        if clean_q:
+            fts_query = " OR ".join(f'"{word}"*' for word in clean_q.split() if word)
+            cur = conn.execute("""
+                SELECT
+                    c.id AS chunk_id,
+                    c.note_id,
+                    c.heading,
+                    c.text,
+                    c.line_start,
+                    c.line_end,
+                    n.rel_path,
+                    n.title,
+                    bm25(fts_chunks) AS fts_score
+                FROM fts_chunks f
+                JOIN chunks c ON c.id = f.rowid
+                JOIN notes n ON n.id = c.note_id
+                WHERE fts_chunks MATCH ?
+                ORDER BY fts_score ASC
+                LIMIT 25;
+            """, (fts_query,))
+            fts_results = [dict(r) for r in cur.fetchall()]
+    except Exception:
+        fts_results = []
+
+    # Stage 1B: Dense Vector search via BGE-M3 (1024-dim cosine distance)
+    vec_results: List[Dict[str, Any]] = []
+    try:
+        embed_model = get_embed_model()
+        q_emb = embed_model.encode([query], normalize_embeddings=True)[0]
+        q_bytes = serialize_f32(q_emb.tolist())
+
+        cur = conn.execute("""
+            SELECT
+                c.id AS chunk_id,
+                c.note_id,
+                c.heading,
+                c.text,
+                c.line_start,
+                c.line_end,
+                n.rel_path,
+                n.title,
+                v.distance AS cosine_dist
+            FROM vec_chunks v
+            JOIN chunks c ON c.id = v.chunk_id
+            JOIN notes n ON n.id = c.note_id
+            WHERE v.embedding MATCH ? AND k = 25
+            ORDER BY v.distance ASC;
+        """, (q_bytes,))
+        vec_results = [dict(r) for r in cur.fetchall()]
+    except Exception as e:
+        return [{"error": f"Vector retrieval error: {str(e)}"}]
+
+    # Stage 1C: Reciprocal Rank Fusion (RRF, k=60)
+    rrf_scores: Dict[int, float] = {}
+    candidate_meta: Dict[int, Dict[str, Any]] = {}
+    k_rrf = 60.0
+
+    for rank, item in enumerate(fts_results):
+        cid = item["chunk_id"]
+        rrf_scores[cid] = rrf_scores.get(cid, 0.0) + (1.0 / (k_rrf + rank + 1))
+        candidate_meta[cid] = item
+
+    for rank, item in enumerate(vec_results):
+        cid = item["chunk_id"]
+        rrf_scores[cid] = rrf_scores.get(cid, 0.0) + (1.0 / (k_rrf + rank + 1))
+        if cid not in candidate_meta:
+            candidate_meta[cid] = item
+
+    if not candidate_meta:
+        return []
+
+    # Sort candidates by combined RRF score and take top 15 for Stage 2 Reranking
+    sorted_cids = sorted(rrf_scores.keys(), key=lambda x: rrf_scores[x], reverse=True)
+    top_candidates = [candidate_meta[cid] for cid in sorted_cids[:15]]
+
+    if heading_filter:
+        h_lower = heading_filter.lower()
+        top_candidates = [c for c in top_candidates if h_lower in c["heading"].lower()]
+
+    if not top_candidates:
+        return []
+
+    # Stage 2: Cross-Encoder Reranking via Jina Reranker v2
+    reranker = get_rerank_model()
+    docs_to_rerank = [f"{c['title']} > {c['heading']}\n{c['text']}" for c in top_candidates]
+    rerank_scores = list(reranker.rerank(query=query, documents=docs_to_rerank))
+
+    scored_candidates = []
+    for cand, score in zip(top_candidates, rerank_scores):
+        scored_candidates.append({
+            "rel_path": cand["rel_path"],
+            "title": cand["title"],
+            "heading": cand["heading"],
+            "lines": f"L{cand['line_start']}-L{cand['line_end']}",
+            "relevance_score": round(float(score), 4),
+            "text": cand["text"],
+        })
+
+    # Sort descending by cross-encoder relevance score
+    scored_candidates.sort(key=lambda x: x["relevance_score"], reverse=True)
+    return scored_candidates[:top_k]
+
+
+@mcp.tool()
+def get_note(
+    rel_path: str,
+    offset_line: int = 1,
+    limit_lines: int = 250,
+) -> Dict[str, Any]:
+    """
+    Retrieve full markdown content of a specific note with line number pagination.
+
+    Args:
+        rel_path: Note path relative to vault root (e.g. 'trading/cuantum-setup.md')
+        offset_line: Line number to start reading from (1-indexed)
+        limit_lines: Maximum lines to return in single request
+    """
+    vault_path = Path(DEFAULT_VAULT_PATH).expanduser().resolve()
+    target = (vault_path / rel_path).resolve()
+
+    # Prevent directory traversal attacks
+    if not str(target).startswith(str(vault_path)):
+        return {"error": "Access denied: Path is outside vault directory."}
+
+    if not target.exists() or not target.is_file():
+        return {"error": f"Note file not found: {rel_path}"}
+
+    try:
+        content = target.read_text(encoding="utf-8", errors="replace")
+        all_lines = content.splitlines()
+        total_lines = len(all_lines)
+
+        start = max(1, offset_line) - 1
+        end = min(total_lines, start + limit_lines)
+        sliced = all_lines[start:end]
+
+        formatted = "\n".join(f"{idx + 1:4d} | {line}" for idx, line in enumerate(sliced, start=start))
+        return {
+            "rel_path": rel_path,
+            "total_lines": total_lines,
+            "start_line": start + 1,
+            "end_line": end,
+            "has_more": end < total_lines,
+            "content": formatted,
+        }
+    except Exception as e:
+        return {"error": f"Failed reading note: {str(e)}"}
+
+
+@mcp.tool()
+def sync_vault() -> Dict[str, Any]:
+    """
+    Trigger incremental sync on the Obsidian vault.
+    Scans for created, modified, or deleted notes and updates dense vectors & FTS5 index.
+    """
+    vault_path = Path(DEFAULT_VAULT_PATH).expanduser().resolve()
+    db_path = Path(DEFAULT_DB_PATH).expanduser().resolve()
+
+    try:
+        build_index(vault_path=vault_path, db_path=db_path, rebuild=False, batch_size=15)
+        return {
+            "status": "success",
+            "message": "Incremental sync completed successfully.",
+            "vault_path": str(vault_path),
+            "db_path": str(db_path),
+        }
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+def main():
+    mcp.run()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,63 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "obsidian-hybrid-rag-mcp"
+version = "1.0.0"
+description = "Production-grade Local Hybrid RAG MCP Server for Obsidian Vaults using SOTA BAAI/bge-m3 & Jina Reranker v2"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [
+    { name = "Muhammad Pandu Dwi Cahyo", email = "mpandudc@gmail.com" }
+]
+keywords = [
+    "mcp",
+    "model-context-protocol",
+    "rag",
+    "hybrid-rag",
+    "obsidian",
+    "sqlite-vec",
+    "bge-m3",
+    "jina-reranker",
+    "hybrid-search",
+    "fastmcp",
+    "local-ai"
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Database",
+]
+dependencies = [
+    "fastmcp>=0.4.0",
+    "sqlite-vec>=0.1.6",
+    "sentence-transformers>=3.0.0",
+    "torch>=2.2.0",
+    "fastembed>=0.4.0",
+    "numpy>=1.24.0",
+    "pydantic>=2.0.0",
+    "rich>=13.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/mpandudc/obsidian-hybrid-rag-mcp"
+Repository = "https://github.com/mpandudc/obsidian-hybrid-rag-mcp"
+
+[project.scripts]
+vault-indexer = "src.indexer:main"
+vault-mcp = "src.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
