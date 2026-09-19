@@ -1,14 +1,18 @@
 """
 FastMCP Stdio Server for Obsidian Hybrid RAG.
 Features Two-Stage Retrieval: FTS5 BM25 + BGE-M3 Dense Vectors + Jina Reranker v2 Cross-Encoder.
+Includes LRU Search Cache and note authoring tools (vault_write, vault_append).
 """
 
 from __future__ import annotations
 import os
+import re
 import sqlite3
 import struct
+import subprocess
+from collections import OrderedDict
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import sqlite_vec
 import torch
@@ -28,6 +32,29 @@ mcp = FastMCP("obsidian-hybrid-rag")
 # Lazy model singletons
 _EMBED_MODEL: Optional[SentenceTransformer] = None
 _RERANK_MODEL: Optional[TextCrossEncoder] = None
+
+# LRU Search Cache (in-memory)
+_SEARCH_CACHE_MAX_SIZE = 128
+_SEARCH_CACHE: OrderedDict[Tuple[str, int, Optional[str]], List[Dict[str, Any]]] = OrderedDict()
+
+
+def cache_get(key: Tuple[str, int, Optional[str]]) -> Optional[List[Dict[str, Any]]]:
+    if key in _SEARCH_CACHE:
+        _SEARCH_CACHE.move_to_end(key)
+        return _SEARCH_CACHE[key]
+    return None
+
+
+def cache_put(key: Tuple[str, int, Optional[str]], value: List[Dict[str, Any]]) -> None:
+    if key in _SEARCH_CACHE:
+        _SEARCH_CACHE.move_to_end(key)
+    _SEARCH_CACHE[key] = value
+    if len(_SEARCH_CACHE) > _SEARCH_CACHE_MAX_SIZE:
+        _SEARCH_CACHE.popitem(last=False)
+
+
+def cache_clear() -> None:
+    _SEARCH_CACHE.clear()
 
 
 def get_embed_model() -> SentenceTransformer:
@@ -62,6 +89,17 @@ def serialize_f32(vec: List[float]) -> bytes:
     return struct.pack(f"{len(vec)}f", *vec)
 
 
+def _trigger_background_sync() -> None:
+    """Trigger non-blocking background index sync if indexer script or tool exists."""
+    indexer_script = Path.home() / "scripts" / "vault-indexer.py"
+    if indexer_script.exists():
+        subprocess.Popen(
+            ["flock", "-n", "/tmp/vault-indexer.lock", str(indexer_script)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+
 @mcp.tool()
 def search_vault(
     query: str,
@@ -72,12 +110,18 @@ def search_vault(
     Search your Obsidian knowledge base using state-of-the-art Hybrid RAG.
     Combines SQLite FTS5 (BM25 lexical), BAAI/bge-m3 (1024-dim dense semantic vector),
     Reciprocal Rank Fusion (RRF), and Jina Reranker v2 Cross-Encoder scoring.
+    Features an in-memory LRU cache for repeat queries.
 
     Args:
         query: Natural language question or search phrase
         top_k: Number of highest-ranking passages to return (default 5)
         heading_filter: Optional substring filter for document section headers
     """
+    cache_key = (query.strip().lower(), top_k, heading_filter.lower() if heading_filter else None)
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return cached
+
     db_path = Path(DEFAULT_DB_PATH).expanduser().resolve()
     if not db_path.exists():
         return [{"error": f"Database file not found at {db_path}. Please run indexer first."}]
@@ -189,7 +233,9 @@ def search_vault(
 
     # Sort descending by cross-encoder relevance score
     scored_candidates.sort(key=lambda x: x["relevance_score"], reverse=True)
-    return scored_candidates[:top_k]
+    result = scored_candidates[:top_k]
+    cache_put(cache_key, result)
+    return result
 
 
 @mcp.tool()
@@ -239,6 +285,141 @@ def get_note(
 
 
 @mcp.tool()
+def write_note(
+    rel_path: str,
+    content: str,
+    title: str = "",
+    tags: str = "",
+) -> Dict[str, Any]:
+    """
+    Create or overwrite a markdown note in the Obsidian Second Brain.
+    Ensures YAML frontmatter with title & tags, invalidates search cache, and triggers background index sync.
+
+    Args:
+        rel_path: Note path relative to vault root (e.g. 'research/carf-tax.md')
+        content: Note body. Must use [[wikilinks]] for linked concepts.
+        title: Optional document title for YAML frontmatter
+        tags: Optional comma-separated tags (e.g. 'crypto, tax, compliance')
+    """
+    clean_rel = rel_path.strip("/ ")
+    if not clean_rel.endswith(".md"):
+        clean_rel += ".md"
+
+    vault_path = Path(DEFAULT_VAULT_PATH).expanduser().resolve()
+    target = (vault_path / clean_rel).resolve()
+
+    if not str(target).startswith(str(vault_path)):
+        return {"status": "error", "error": f"Access denied: Path `{rel_path}` outside vault directory."}
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    final_title = title.strip() or target.stem
+    tag_list = [t.strip().lstrip("#") for t in tags.split(",") if t.strip()] if tags else []
+
+    full_content = content
+    if not content.startswith("---") and (final_title or tag_list):
+        fm_lines = ["---", f'title: "{final_title}"']
+        if tag_list:
+            fm_lines.append(f"tags: [{', '.join(tag_list)}]")
+        fm_lines.append(f"updated: {Path(__file__).stat().st_mtime if Path(__file__).exists() else ''}")
+        fm_lines.extend(["---", "", ""])
+        full_content = "\n".join(fm_lines) + content
+
+    target.write_text(full_content, encoding="utf-8")
+
+    # Invalidate cache & trigger background indexing
+    cache_clear()
+    _trigger_background_sync()
+
+    wikilink_count = len(re.findall(r"\[\[([^\]]+)\]\]", full_content))
+    return {
+        "status": "success",
+        "rel_path": clean_rel,
+        "bytes_written": len(full_content.encode("utf-8")),
+        "wikilinks_detected": wikilink_count,
+        "message": f"Note `{clean_rel}` written successfully.",
+    }
+
+
+@mcp.tool()
+def append_note(
+    rel_path: str,
+    content: str,
+    heading: str = "",
+) -> Dict[str, Any]:
+    """
+    Append text to an existing note or under a specific heading in the Obsidian Second Brain.
+
+    Args:
+        rel_path: Note path relative to vault root (e.g. 'daily/2026-09-19.md')
+        content: Text to append. Use [[wikilinks]] for linked concepts.
+        heading: Optional heading name under which to append content.
+    """
+    clean_rel = rel_path.strip("/ ")
+    if not clean_rel.endswith(".md"):
+        clean_rel += ".md"
+
+    vault_path = Path(DEFAULT_VAULT_PATH).expanduser().resolve()
+    target = (vault_path / clean_rel).resolve()
+
+    if not str(target).startswith(str(vault_path)):
+        return {"status": "error", "error": f"Access denied: Path `{rel_path}` outside vault directory."}
+
+    if not target.exists():
+        matches = list(vault_path.glob(f"**/{Path(clean_rel).name}"))
+        if matches:
+            target = matches[0]
+            clean_rel = str(target.relative_to(vault_path))
+        else:
+            return {"status": "error", "error": f"Note `{rel_path}` not found in vault."}
+
+    try:
+        existing = target.read_text(encoding="utf-8", errors="replace")
+    except Exception as e:
+        return {"status": "error", "error": f"Failed reading note: {str(e)}"}
+
+    if not heading:
+        new_content = existing.rstrip() + "\n\n" + content.strip() + "\n"
+    else:
+        lines = existing.splitlines()
+        target_clean = heading.strip().lower()
+        idx_to_insert = -1
+        heading_level = 0
+        h_regex = re.compile(r"^(#{1,6})\s+(.+)$")
+
+        for i, line in enumerate(lines):
+            m = h_regex.match(line)
+            if m:
+                lvl = len(m.group(1))
+                h_name = m.group(2).strip()
+                if idx_to_insert != -1:
+                    if lvl <= heading_level:
+                        idx_to_insert = i
+                        break
+                elif target_clean in h_name.lower():
+                    heading_level = lvl
+                    idx_to_insert = i + 1
+
+        if idx_to_insert != -1:
+            lines.insert(idx_to_insert, "\n" + content.strip())
+            new_content = "\n".join(lines) + "\n"
+        else:
+            new_content = existing.rstrip() + f"\n\n## {heading}\n\n" + content.strip() + "\n"
+
+    target.write_text(new_content, encoding="utf-8")
+
+    cache_clear()
+    _trigger_background_sync()
+
+    return {
+        "status": "success",
+        "rel_path": clean_rel,
+        "heading_targeted": heading or "end_of_file",
+        "message": f"Appended content to `{clean_rel}`.",
+    }
+
+
+@mcp.tool()
 def sync_vault() -> Dict[str, Any]:
     """
     Trigger incremental sync on the Obsidian vault.
@@ -249,6 +430,7 @@ def sync_vault() -> Dict[str, Any]:
 
     try:
         build_index(vault_path=vault_path, db_path=db_path, rebuild=False, batch_size=15)
+        cache_clear()
         return {
             "status": "success",
             "message": "Incremental sync completed successfully.",
