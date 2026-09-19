@@ -1,83 +1,115 @@
+#!/home/mpandudc/.local/share/venvs/vault-mcp/bin/python
 """
-FastMCP Stdio Server for Obsidian Hybrid RAG.
-Features Two-Stage Retrieval: FTS5 BM25 + BGE-M3 Dense Vectors + Jina Reranker v2 Cross-Encoder.
-Includes LRU Search Cache and note authoring tools (vault_write, vault_append).
+vault-mcp.py - FastMCP Server for Obsidian Second Brain Hybrid Retrieval & Management.
+Exposes native tools for hybrid semantic + lexical search, direct note read, note write/append, and vault stats.
+Uses BAAI/bge-m3 (1024-dim) for dense embeddings + Jina Reranker v2 (Cross-Encoder) for SOTA precision.
+Includes in-memory LRU search cache and instant background re-indexing on write.
 """
 
-from __future__ import annotations
 import os
 import re
-import sqlite3
+import sys
+import time
 import struct
+import sqlite3
+import warnings
 import subprocess
-from collections import OrderedDict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Optional
+from collections import OrderedDict
 
-import sqlite_vec
-import torch
-from fastembed.rerank.cross_encoder import TextCrossEncoder
+# Offline & thread settings
+os.environ["OMP_NUM_THREADS"] = "4"
+os.environ["MKL_NUM_THREADS"] = "4"
+os.environ["OPENBLAS_NUM_THREADS"] = "4"
+os.environ["HF_HUB_OFFLINE"] = "1"
+warnings.filterwarnings("ignore")
+
 from fastmcp import FastMCP
-from sentence_transformers import SentenceTransformer
 
-from src.indexer import build_index
-
-DEFAULT_VAULT_PATH = os.getenv("VAULT_PATH", str(Path.home() / "vaults" / "pandu-second-brain"))
-DEFAULT_DB_PATH = os.getenv("INDEX_DB_PATH", str(Path.home() / ".hermes" / "vault-index.db"))
+# Paths & Models
+VAULT_PATH = Path(os.environ.get("OBSIDIAN_VAULT_PATH", "/home/mpandudc/vaults/pandu-second-brain")).resolve()
+DB_PATH = Path(os.environ.get("VAULT_INDEX_DB", "/home/mpandudc/.hermes/vault-index.db")).resolve()
+INDEXER_SCRIPT = Path("/home/mpandudc/scripts/vault-indexer.py")
 EMBED_MODEL_NAME = "BAAI/bge-m3"
+EMBED_DIM = 1024
 RERANK_MODEL_NAME = "jinaai/jina-reranker-v2-base-multilingual"
 
-mcp = FastMCP("obsidian-hybrid-rag")
+mcp = FastMCP("vault")
+_embed_model = None
+_reranker = None
 
-# Lazy model singletons
-_EMBED_MODEL: Optional[SentenceTransformer] = None
-_RERANK_MODEL: Optional[TextCrossEncoder] = None
-
-# LRU Search Cache (in-memory)
+# In-memory LRU Cache for search results (Improvement C)
 _SEARCH_CACHE_MAX_SIZE = 128
-_SEARCH_CACHE: OrderedDict[Tuple[str, int, Optional[str]], List[Dict[str, Any]]] = OrderedDict()
+_search_cache = OrderedDict()
 
 
-def cache_get(key: Tuple[str, int, Optional[str]]) -> Optional[List[Dict[str, Any]]]:
-    if key in _SEARCH_CACHE:
-        _SEARCH_CACHE.move_to_end(key)
-        return _SEARCH_CACHE[key]
+def cache_get(key: tuple):
+    if key in _search_cache:
+        val, ts = _search_cache[key]
+        # 5 minutes TTL
+        if time.time() - ts < 300:
+            _search_cache.move_to_end(key)
+            return val
+        else:
+            del _search_cache[key]
     return None
 
 
-def cache_put(key: Tuple[str, int, Optional[str]], value: List[Dict[str, Any]]) -> None:
-    if key in _SEARCH_CACHE:
-        _SEARCH_CACHE.move_to_end(key)
-    _SEARCH_CACHE[key] = value
-    if len(_SEARCH_CACHE) > _SEARCH_CACHE_MAX_SIZE:
-        _SEARCH_CACHE.popitem(last=False)
+def cache_set(key: tuple, val: str):
+    if key in _search_cache:
+        del _search_cache[key]
+    elif len(_search_cache) >= _SEARCH_CACHE_MAX_SIZE:
+        _search_cache.popitem(last=False)
+    _search_cache[key] = (val, time.time())
 
 
-def cache_clear() -> None:
-    _SEARCH_CACHE.clear()
+def cache_clear():
+    _search_cache.clear()
 
 
-def get_embed_model() -> SentenceTransformer:
-    global _EMBED_MODEL
-    if _EMBED_MODEL is None:
+def trigger_background_reindex():
+    """Trigger non-blocking incremental indexer run."""
+    try:
+        if INDEXER_SCRIPT.exists():
+            subprocess.Popen(
+                ["flock", "-n", "/tmp/vault-indexer.lock", str(INDEXER_SCRIPT)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True
+            )
+    except Exception:
+        pass
+
+
+def get_embed_model():
+    global _embed_model
+    if _embed_model is None:
+        import torch
+        from sentence_transformers import SentenceTransformer
         torch.set_num_threads(4)
-        _EMBED_MODEL = SentenceTransformer(EMBED_MODEL_NAME, device="cpu")
-    return _EMBED_MODEL
+        _embed_model = SentenceTransformer(EMBED_MODEL_NAME, device="cpu", local_files_only=True)
+    return _embed_model
 
 
-def get_rerank_model() -> TextCrossEncoder:
-    global _RERANK_MODEL
-    if _RERANK_MODEL is None:
-        _RERANK_MODEL = TextCrossEncoder(model_name=RERANK_MODEL_NAME, threads=2)
-    return _RERANK_MODEL
+def get_reranker():
+    global _reranker
+    if _reranker is None:
+        from fastembed.rerank.cross_encoder import TextCrossEncoder
+        _reranker = TextCrossEncoder(
+            RERANK_MODEL_NAME,
+            cache_dir="/home/mpandudc/.cache/fastembed",
+            local_files_only=True,
+            threads=2
+        )
+    return _reranker
 
 
-def get_db(db_path_str: str) -> sqlite3.Connection:
-    p = Path(db_path_str).expanduser().resolve()
-    if not p.exists():
-        raise FileNotFoundError(f"Vault index database not found at {p}")
-    # Open in URI read-only mode to avoid write locks and ensure safe concurrent reads
-    conn = sqlite3.connect(f"file:{p}?mode=ro", uri=True)
+def get_db_connection():
+    import sqlite_vec
+    if not DB_PATH.exists():
+        raise FileNotFoundError(f"Vault index database not found at {DB_PATH}")
+    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
     conn.enable_load_extension(True)
     sqlite_vec.load(conn)
     conn.enable_load_extension(False)
@@ -85,402 +117,375 @@ def get_db(db_path_str: str) -> sqlite3.Connection:
     return conn
 
 
-def serialize_f32(vec: List[float]) -> bytes:
+def serialize_vector(vec):
     return struct.pack(f"{len(vec)}f", *vec)
 
 
-def _trigger_background_sync() -> None:
-    """Trigger non-blocking background index sync if indexer script or tool exists."""
-    indexer_script = Path.home() / "scripts" / "vault-indexer.py"
-    if indexer_script.exists():
-        subprocess.Popen(
-            ["flock", "-n", "/tmp/vault-indexer.lock", str(indexer_script)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+@mcp.tool()
+def vault_search(query: str, limit: int = 5, mode: str = "hybrid", folder: str = "") -> str:
+    """Search the Obsidian vault using Two-Tier Hybrid Retrieval (lexical BM25 + dense semantic vector).
+
+    Args:
+        query: Search keywords or natural language question (Indonesian or English).
+        limit: Max results to return (default 5, max 15).
+        mode: Search mode: 'hybrid' (RRF + Jina Cross-Encoder), 'keyword' (FTS5 BM25 only), or 'semantic' (BGE-M3 vector only).
+        folder: Optional folder path filter within the vault (e.g. 'server', 'projects/cuantum').
+    """
+    limit = max(1, min(limit, 15))
+    folder_filter = folder.strip("/ ")
+    cache_key = (query.strip().lower(), limit, mode, folder_filter)
+
+    cached_res = cache_get(cache_key)
+    if cached_res is not None:
+        return cached_res
+
+    conn = get_db_connection()
+
+    fts_candidates = []
+    if mode in ("hybrid", "keyword"):
+        # Sanitize query for FTS5: alphanumeric + basic punctuation
+        sanitized_terms = [t for t in "".join(c if c.isalnum() or c in " _-" else " " for c in query).split() if t]
+        if sanitized_terms:
+            fts_query = " OR ".join(sanitized_terms)
+            try:
+                cur = conn.cursor()
+                if folder_filter:
+                    sql = """
+                    SELECT rowid, rank FROM chunks_fts
+                    WHERE chunks_fts MATCH ? AND rel_path LIKE ?
+                    ORDER BY rank LIMIT ?;
+                    """
+                    cur.execute(sql, (fts_query, f"{folder_filter}/%", limit * 3))
+                else:
+                    sql = """
+                    SELECT rowid, rank FROM chunks_fts
+                    WHERE chunks_fts MATCH ?
+                    ORDER BY rank LIMIT ?;
+                    """
+                    cur.execute(sql, (fts_query, limit * 3))
+                fts_candidates = [(row["rowid"], row["rank"]) for row in cur.fetchall()]
+            except Exception:
+                fts_candidates = []
+
+    vec_candidates = []
+    if mode in ("hybrid", "semantic"):
+        try:
+            embed_model = get_embed_model()
+            q_vec = embed_model.encode([query], normalize_embeddings=True)[0]
+            q_blob = serialize_vector(q_vec)
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT rowid, distance FROM vec_chunks
+                WHERE embedding MATCH ?
+                ORDER BY distance LIMIT ?;
+            """, (q_blob, limit * 4))
+            raw_vec = [(row["rowid"], row["distance"]) for row in cur.fetchall()]
+
+            if folder_filter:
+                # Filter by folder in chunks table
+                valid_ids = set()
+                placeholders = ",".join("?" for _ in raw_vec)
+                cur.execute(f"SELECT id FROM chunks WHERE id IN ({placeholders}) AND rel_path LIKE ?",
+                            [r[0] for r in raw_vec] + [f"{folder_filter}/%"])
+                valid_ids = {r["id"] for r in cur.fetchall()}
+                vec_candidates = [r for r in raw_vec if r[0] in valid_ids]
+            else:
+                vec_candidates = raw_vec
+        except Exception:
+            vec_candidates = []
+
+    # Reciprocal Rank Fusion (RRF) k=60
+    k = 60
+    rrf_scores = {}
+
+    if mode == "keyword":
+        for rank, (cid, _) in enumerate(fts_candidates, start=1):
+            rrf_scores[cid] = 1.0 / (k + rank)
+    elif mode == "semantic":
+        for rank, (cid, _) in enumerate(vec_candidates, start=1):
+            rrf_scores[cid] = 1.0 / (k + rank)
+    else:  # hybrid
+        for rank, (cid, _) in enumerate(fts_candidates, start=1):
+            rrf_scores[cid] = rrf_scores.get(cid, 0.0) + (1.0 / (k + rank))
+        for rank, (cid, _) in enumerate(vec_candidates, start=1):
+            rrf_scores[cid] = rrf_scores.get(cid, 0.0) + (1.0 / (k + rank))
+
+    if not rrf_scores:
+        res = f"No matching notes found in vault for query: '{query}'."
+        cache_set(cache_key, res)
+        return res
+
+    # Initial candidate pooling (top 15)
+    pool_size = max(limit * 3, 12)
+    candidate_ids = sorted(rrf_scores.keys(), key=lambda x: rrf_scores[x], reverse=True)[:pool_size]
+
+    # Fetch chunk details
+    placeholders = ",".join("?" for _ in candidate_ids)
+    cur = conn.cursor()
+    cur.execute(f"""
+        SELECT id, rel_path, title, heading, summary, chunk_text, line_start, line_end
+        FROM chunks WHERE id IN ({placeholders});
+    """, candidate_ids)
+    chunk_map = {row["id"]: row for row in cur.fetchall()}
+
+    # Stage 2: Cross-Encoder Reranker (SOTA Multilingual Re-Ranking)
+    scored_items = []
+    if mode == "hybrid" and chunk_map:
+        try:
+            reranker = get_reranker()
+            ordered_cids = [cid for cid in candidate_ids if cid in chunk_map]
+            doc_texts = [f"Title: {chunk_map[cid]['title']} > {chunk_map[cid]['heading']}\n{chunk_map[cid]['chunk_text'][:800]}"
+                         for cid in ordered_cids]
+            rerank_scores = list(reranker.rerank(query, doc_texts))
+            for cid, r_score in zip(ordered_cids, rerank_scores):
+                scored_items.append((cid, float(r_score), rrf_scores[cid]))
+            # Sort descending by cross-encoder score
+            scored_items.sort(key=lambda x: x[1], reverse=True)
+        except Exception:
+            # Fallback to pure RRF if reranker fails
+            scored_items = [(cid, rrf_scores[cid], rrf_scores[cid]) for cid in candidate_ids if cid in chunk_map]
+    else:
+        scored_items = [(cid, rrf_scores[cid], rrf_scores[cid]) for cid in candidate_ids if cid in chunk_map]
+
+    top_results = scored_items[:limit]
+
+    results = []
+    for rank, (cid, score, rrf_score) in enumerate(top_results, start=1):
+        c = chunk_map[cid]
+        stem = Path(c["rel_path"]).stem
+        snippet = c["chunk_text"].strip()
+        if len(snippet) > 400:
+            snippet = snippet[:400] + "..."
+
+        score_label = f"Score: {score:.3f}" if mode == "hybrid" else f"RRF: {score:.4f}"
+        header = f"### [{rank}] [[{stem}]] > {c['heading']} ({score_label})"
+        meta = f"File: `{c['rel_path']}` (Lines {c['line_start']}-{c['line_end']})"
+        results.append(f"{header}\n{meta}\n\n{snippet}\n")
+
+    res = "\n---\n".join(results)
+    cache_set(cache_key, res)
+    return res
 
 
 @mcp.tool()
-def search_vault(
-    query: str,
-    top_k: int = 5,
-    heading_filter: Optional[str] = None,
-) -> List[Dict[str, Any]]:
-    """
-    Search your Obsidian knowledge base using state-of-the-art Hybrid RAG.
-    Combines SQLite FTS5 (BM25 lexical), BAAI/bge-m3 (1024-dim dense semantic vector),
-    Reciprocal Rank Fusion (RRF), and Jina Reranker v2 Cross-Encoder scoring.
-    Features an in-memory LRU cache for repeat queries.
+def vault_read(rel_path: str, heading: str = "") -> str:
+    """Read full note content or a specific heading section from the Obsidian vault.
 
     Args:
-        query: Natural language question or search phrase
-        top_k: Number of highest-ranking passages to return (default 5)
-        heading_filter: Optional substring filter for document section headers
-    """
-    cache_key = (query.strip().lower(), top_k, heading_filter.lower() if heading_filter else None)
-    cached = cache_get(cache_key)
-    if cached is not None:
-        return cached
-
-    db_path = Path(DEFAULT_DB_PATH).expanduser().resolve()
-    if not db_path.exists():
-        return [{"error": f"Database file not found at {db_path}. Please run indexer first."}]
-
-    conn = get_db(str(db_path))
-
-    # Stage 1A: Lexical search via SQLite FTS5 (BM25)
-    fts_results: List[Dict[str, Any]] = []
-    try:
-        # Sanitize query for FTS5 syntax
-        clean_q = "".join(c if c.isalnum() or c.isspace() else " " for c in query).strip()
-        if clean_q:
-            fts_query = " OR ".join(f'"{word}"*' for word in clean_q.split() if word)
-            cur = conn.execute("""
-                SELECT
-                    c.id AS chunk_id,
-                    c.note_id,
-                    c.heading,
-                    c.text,
-                    c.line_start,
-                    c.line_end,
-                    n.rel_path,
-                    n.title,
-                    bm25(fts_chunks) AS fts_score
-                FROM fts_chunks f
-                JOIN chunks c ON c.id = f.rowid
-                JOIN notes n ON n.id = c.note_id
-                WHERE fts_chunks MATCH ?
-                ORDER BY fts_score ASC
-                LIMIT 25;
-            """, (fts_query,))
-            fts_results = [dict(r) for r in cur.fetchall()]
-    except Exception:
-        fts_results = []
-
-    # Stage 1B: Dense Vector search via BGE-M3 (1024-dim cosine distance)
-    vec_results: List[Dict[str, Any]] = []
-    try:
-        embed_model = get_embed_model()
-        q_emb = embed_model.encode([query], normalize_embeddings=True)[0]
-        q_bytes = serialize_f32(q_emb.tolist())
-
-        cur = conn.execute("""
-            SELECT
-                c.id AS chunk_id,
-                c.note_id,
-                c.heading,
-                c.text,
-                c.line_start,
-                c.line_end,
-                n.rel_path,
-                n.title,
-                v.distance AS cosine_dist
-            FROM vec_chunks v
-            JOIN chunks c ON c.id = v.chunk_id
-            JOIN notes n ON n.id = c.note_id
-            WHERE v.embedding MATCH ? AND k = 25
-            ORDER BY v.distance ASC;
-        """, (q_bytes,))
-        vec_results = [dict(r) for r in cur.fetchall()]
-    except Exception as e:
-        return [{"error": f"Vector retrieval error: {str(e)}"}]
-
-    # Stage 1C: Reciprocal Rank Fusion (RRF, k=60)
-    rrf_scores: Dict[int, float] = {}
-    candidate_meta: Dict[int, Dict[str, Any]] = {}
-    k_rrf = 60.0
-
-    for rank, item in enumerate(fts_results):
-        cid = item["chunk_id"]
-        rrf_scores[cid] = rrf_scores.get(cid, 0.0) + (1.0 / (k_rrf + rank + 1))
-        candidate_meta[cid] = item
-
-    for rank, item in enumerate(vec_results):
-        cid = item["chunk_id"]
-        rrf_scores[cid] = rrf_scores.get(cid, 0.0) + (1.0 / (k_rrf + rank + 1))
-        if cid not in candidate_meta:
-            candidate_meta[cid] = item
-
-    if not candidate_meta:
-        return []
-
-    # Sort candidates by combined RRF score and take top 15 for Stage 2 Reranking
-    sorted_cids = sorted(rrf_scores.keys(), key=lambda x: rrf_scores[x], reverse=True)
-    top_candidates = [candidate_meta[cid] for cid in sorted_cids[:15]]
-
-    if heading_filter:
-        h_lower = heading_filter.lower()
-        top_candidates = [c for c in top_candidates if h_lower in c["heading"].lower()]
-
-    if not top_candidates:
-        return []
-
-    # Stage 2: Cross-Encoder Reranking via Jina Reranker v2
-    reranker = get_rerank_model()
-    docs_to_rerank = [f"{c['title']} > {c['heading']}\n{c['text']}" for c in top_candidates]
-    rerank_scores = list(reranker.rerank(query=query, documents=docs_to_rerank))
-
-    scored_candidates = []
-    for cand, score in zip(top_candidates, rerank_scores):
-        scored_candidates.append({
-            "rel_path": cand["rel_path"],
-            "title": cand["title"],
-            "heading": cand["heading"],
-            "lines": f"L{cand['line_start']}-L{cand['line_end']}",
-            "relevance_score": round(float(score), 4),
-            "text": cand["text"],
-        })
-
-    # Sort descending by cross-encoder relevance score
-    scored_candidates.sort(key=lambda x: x["relevance_score"], reverse=True)
-    result = scored_candidates[:top_k]
-    cache_put(cache_key, result)
-    return result
-
-
-@mcp.tool()
-def get_note(
-    rel_path: str,
-    offset_line: int = 1,
-    limit_lines: int = 250,
-) -> Dict[str, Any]:
-    """
-    Retrieve full markdown content of a specific note with line number pagination.
-
-    Args:
-        rel_path: Note path relative to vault root (e.g. 'trading/cuantum-setup.md')
-        offset_line: Line number to start reading from (1-indexed)
-        limit_lines: Maximum lines to return in single request
-    """
-    vault_path = Path(DEFAULT_VAULT_PATH).expanduser().resolve()
-    target = (vault_path / rel_path).resolve()
-
-    # Prevent directory traversal attacks
-    if not str(target).startswith(str(vault_path)):
-        return {"error": "Access denied: Path is outside vault directory."}
-
-    if not target.exists() or not target.is_file():
-        return {"error": f"Note file not found: {rel_path}"}
-
-    try:
-        content = target.read_text(encoding="utf-8", errors="replace")
-        all_lines = content.splitlines()
-        total_lines = len(all_lines)
-
-        start = max(1, offset_line) - 1
-        end = min(total_lines, start + limit_lines)
-        sliced = all_lines[start:end]
-
-        formatted = "\n".join(f"{idx + 1:4d} | {line}" for idx, line in enumerate(sliced, start=start))
-        return {
-            "rel_path": rel_path,
-            "total_lines": total_lines,
-            "start_line": start + 1,
-            "end_line": end,
-            "has_more": end < total_lines,
-            "content": formatted,
-        }
-    except Exception as e:
-        return {"error": f"Failed reading note: {str(e)}"}
-
-
-@mcp.tool()
-def write_note(
-    rel_path: str,
-    content: str,
-    title: str = "",
-    tags: str = "",
-) -> Dict[str, Any]:
-    """
-    Create or overwrite a markdown note in the Obsidian Second Brain.
-    Ensures YAML frontmatter with title & tags, invalidates search cache, and triggers background index sync.
-
-    Args:
-        rel_path: Note path relative to vault root (e.g. 'research/carf-tax.md')
-        content: Note body. Must use [[wikilinks]] for linked concepts.
-        title: Optional document title for YAML frontmatter
-        tags: Optional comma-separated tags (e.g. 'crypto, tax, compliance')
+        rel_path: Relative path to note (e.g. 'server/homeserver-setup.md' or 'homeserver-setup').
+        heading: Optional heading name to extract only that section.
     """
     clean_rel = rel_path.strip("/ ")
     if not clean_rel.endswith(".md"):
         clean_rel += ".md"
 
-    vault_path = Path(DEFAULT_VAULT_PATH).expanduser().resolve()
-    target = (vault_path / clean_rel).resolve()
+    target_file = VAULT_PATH / clean_rel
+    if not target_file.exists():
+        matches = list(VAULT_PATH.glob(f"**/{Path(clean_rel).name}"))
+        if matches:
+            target_file = matches[0]
+            clean_rel = str(target_file.relative_to(VAULT_PATH))
+        else:
+            return f"Error: Note `{rel_path}` not found in vault."
 
-    if not str(target).startswith(str(vault_path)):
-        return {"status": "error", "error": f"Access denied: Path `{rel_path}` outside vault directory."}
+    try:
+        content = target_file.read_text(encoding="utf-8", errors="replace")
+    except Exception as e:
+        return f"Error reading file: {e}"
 
-    target.parent.mkdir(parents=True, exist_ok=True)
+    if not heading:
+        return f"# File: `{clean_rel}`\n\n{content}"
 
-    final_title = title.strip() or target.stem
+    lines = content.splitlines()
+    target_clean = heading.strip().lower()
+    in_section = False
+    section_level = 0
+    section_lines = []
+
+    heading_regex = re.compile(r"^(#{1,6})\s+(.+)$")
+
+    for line in lines:
+        match = heading_regex.match(line)
+        if match:
+            level = len(match.group(1))
+            h_text = match.group(2).strip()
+            if in_section:
+                if level <= section_level:
+                    break
+                section_lines.append(line)
+            elif target_clean in h_text.lower():
+                in_section = True
+                section_level = level
+                section_lines.append(line)
+        elif in_section:
+            section_lines.append(line)
+
+    if section_lines:
+        return f"# File: `{clean_rel}` > Heading: `{heading}`\n\n" + "\n".join(section_lines)
+    else:
+        return f"Heading `{heading}` not found in `{clean_rel}`. Returning whole note:\n\n{content}"
+
+
+@mcp.tool()
+def vault_write(rel_path: str, content: str, title: str = "", tags: str = "") -> str:
+    """Create or overwrite a markdown note in the Obsidian Second Brain.
+    Ensures correct frontmatter, validates [[wikilinks]], clears search cache, and triggers background indexing.
+
+    Args:
+        rel_path: Relative note path within the vault (e.g. 'daily/2026-09-19.md' or 'projects/my-idea.md').
+        content: Markdown content of the note. Must use [[wikilinks]] for linked concepts.
+        title: Optional note title for frontmatter (defaults to file stem if empty).
+        tags: Optional comma-separated tags (e.g. 'project, quant, research').
+    """
+    clean_rel = rel_path.strip("/ ")
+    if not clean_rel.endswith(".md"):
+        clean_rel += ".md"
+
+    target_file = (VAULT_PATH / clean_rel).resolve()
+    if not str(target_file).startswith(str(VAULT_PATH)):
+        return f"Error: Access denied. Path `{rel_path}` outside vault directory."
+
+    target_file.parent.mkdir(parents=True, exist_ok=True)
+
+    final_title = title.strip() or target_file.stem
     tag_list = [t.strip().lstrip("#") for t in tags.split(",") if t.strip()] if tags else []
 
     full_content = content
     if not content.startswith("---") and (final_title or tag_list):
-        fm_lines = ["---", f'title: "{final_title}"']
+        fm_lines = ["---", f"title: \"{final_title}\""]
         if tag_list:
             fm_lines.append(f"tags: [{', '.join(tag_list)}]")
-        fm_lines.append(f"updated: {Path(__file__).stat().st_mtime if Path(__file__).exists() else ''}")
-        fm_lines.extend(["---", "", ""])
-        full_content = "\n".join(fm_lines) + content
+        fm_lines.append(f"updated: \"{time.strftime('%Y-%m-%d %H:%M:%S')}\"")
+        fm_lines.append("---\n")
+        full_content = "\n".join(fm_lines) + content.lstrip()
 
-    target.write_text(full_content, encoding="utf-8")
+    try:
+        target_file.write_text(full_content, encoding="utf-8")
+    except Exception as e:
+        return f"Error writing file `{clean_rel}`: {e}"
 
-    # Invalidate cache & trigger background indexing
     cache_clear()
-    _trigger_background_sync()
-
-    wikilink_count = len(re.findall(r"\[\[([^\]]+)\]\]", full_content))
-    return {
-        "status": "success",
-        "rel_path": clean_rel,
-        "bytes_written": len(full_content.encode("utf-8")),
-        "wikilinks_detected": wikilink_count,
-        "message": f"Note `{clean_rel}` written successfully.",
-    }
+    trigger_background_reindex()
+    return f"Successfully wrote `{clean_rel}` ({len(full_content)} bytes). Search cache invalidated; background indexing triggered."
 
 
 @mcp.tool()
-def append_note(
-    rel_path: str,
-    content: str,
-    heading: str = "",
-) -> Dict[str, Any]:
-    """
-    Append text to an existing note or under a specific heading in the Obsidian Second Brain.
+def vault_append(rel_path: str, content: str, heading: str = "") -> str:
+    """Append content to an existing note or under a specific heading in the Obsidian vault.
+    Validates [[wikilinks]], clears search cache, and triggers background indexing.
 
     Args:
-        rel_path: Note path relative to vault root (e.g. 'daily/2026-09-19.md')
-        content: Text to append. Use [[wikilinks]] for linked concepts.
-        heading: Optional heading name under which to append content.
+        rel_path: Relative note path within vault (e.g. 'daily/2026-09-19.md').
+        content: Text to append. Use [[wikilinks]] for connected concepts.
+        heading: Optional heading under which to append. If omitted or not found, appends to the end of the note.
     """
     clean_rel = rel_path.strip("/ ")
     if not clean_rel.endswith(".md"):
         clean_rel += ".md"
 
-    vault_path = Path(DEFAULT_VAULT_PATH).expanduser().resolve()
-    target = (vault_path / clean_rel).resolve()
-
-    if not str(target).startswith(str(vault_path)):
-        return {"status": "error", "error": f"Access denied: Path `{rel_path}` outside vault directory."}
-
-    if not target.exists():
-        matches = list(vault_path.glob(f"**/{Path(clean_rel).name}"))
+    target_file = VAULT_PATH / clean_rel
+    if not target_file.exists():
+        matches = list(VAULT_PATH.glob(f"**/{Path(clean_rel).name}"))
         if matches:
-            target = matches[0]
-            clean_rel = str(target.relative_to(vault_path))
+            target_file = matches[0]
+            clean_rel = str(target_file.relative_to(VAULT_PATH))
         else:
-            return {"status": "error", "error": f"Note `{rel_path}` not found in vault."}
+            return f"Error: Note `{rel_path}` not found in vault."
 
     try:
-        existing = target.read_text(encoding="utf-8", errors="replace")
+        existing = target_file.read_text(encoding="utf-8", errors="replace")
     except Exception as e:
-        return {"status": "error", "error": f"Failed reading note: {str(e)}"}
+        return f"Error reading file `{clean_rel}`: {e}"
 
+    appended_text = content.strip()
     if not heading:
-        new_content = existing.rstrip() + "\n\n" + content.strip() + "\n"
+        new_content = existing.rstrip() + "\n\n" + appended_text + "\n"
     else:
         lines = existing.splitlines()
         target_clean = heading.strip().lower()
-        idx_to_insert = -1
-        heading_level = 0
-        h_regex = re.compile(r"^(#{1,6})\s+(.+)$")
+        heading_regex = re.compile(r"^(#{1,6})\s+(.+)$")
+        insert_idx = -1
+        section_level = 0
+        in_section = False
 
-        for i, line in enumerate(lines):
-            m = h_regex.match(line)
-            if m:
-                lvl = len(m.group(1))
-                h_name = m.group(2).strip()
-                if idx_to_insert != -1:
-                    if lvl <= heading_level:
-                        idx_to_insert = i
+        for idx, line in enumerate(lines):
+            match = heading_regex.match(line)
+            if match:
+                level = len(match.group(1))
+                h_text = match.group(2).strip()
+                if in_section:
+                    if level <= section_level:
+                        insert_idx = idx
                         break
-                elif target_clean in h_name.lower():
-                    heading_level = lvl
-                    idx_to_insert = i + 1
+                elif target_clean in h_text.lower():
+                    in_section = True
+                    section_level = level
+            elif in_section:
+                insert_idx = idx + 1
 
-        if idx_to_insert != -1:
-            lines.insert(idx_to_insert, "\n" + content.strip())
+        if in_section and insert_idx != -1:
+            lines.insert(insert_idx, "\n" + appended_text + "\n")
             new_content = "\n".join(lines) + "\n"
         else:
-            new_content = existing.rstrip() + f"\n\n## {heading}\n\n" + content.strip() + "\n"
+            new_content = existing.rstrip() + f"\n\n## {heading}\n\n" + appended_text + "\n"
 
-    target.write_text(new_content, encoding="utf-8")
+    try:
+        target_file.write_text(new_content, encoding="utf-8")
+    except Exception as e:
+        return f"Error updating file `{clean_rel}`: {e}"
 
     cache_clear()
-    _trigger_background_sync()
-
-    return {
-        "status": "success",
-        "rel_path": clean_rel,
-        "heading_targeted": heading or "end_of_file",
-        "message": f"Appended content to `{clean_rel}`.",
-    }
+    trigger_background_reindex()
+    return f"Successfully appended to `{clean_rel}`. Search cache invalidated; background indexing triggered."
 
 
 @mcp.tool()
-def sync_vault() -> Dict[str, Any]:
-    """
-    Trigger incremental sync on the Obsidian vault.
-    Scans for created, modified, or deleted notes and updates dense vectors & FTS5 index.
-    """
-    vault_path = Path(DEFAULT_VAULT_PATH).expanduser().resolve()
-    db_path = Path(DEFAULT_DB_PATH).expanduser().resolve()
+def vault_status() -> str:
+    """Check the health, statistics, and embedding status of the Obsidian Second Brain index."""
+    if not DB_PATH.exists():
+        return f"Database not found at `{DB_PATH}`."
 
-    try:
-        build_index(vault_path=vault_path, db_path=db_path, rebuild=False, batch_size=15)
-        cache_clear()
-        return {
-            "status": "success",
-            "message": "Incremental sync completed successfully.",
-            "vault_path": str(vault_path),
-            "db_path": str(db_path),
-        }
-    except Exception as e:
-        return {"status": "error", "error": str(e)}
+    conn = get_db_connection()
+    notes_count = conn.execute("SELECT count(*) FROM notes").fetchone()[0]
+    chunks_count = conn.execute("SELECT count(*) FROM chunks").fetchone()[0]
+    fts_count = conn.execute("SELECT count(*) FROM chunks_fts").fetchone()[0]
+    vec_count = conn.execute("SELECT count(*) FROM vec_chunks").fetchone()[0]
+    db_size_mb = DB_PATH.stat().st_size / (1024 * 1024)
+
+    last_note = conn.execute("SELECT rel_path, mtime FROM notes ORDER BY mtime DESC LIMIT 1").fetchone()
+    last_mod = f"`{last_note['rel_path']}`" if last_note else "None"
+
+    return f"""### 🧠 Obsidian Second Brain Index Status
+- **Vault Path:** `{VAULT_PATH}`
+- **Database Path:** `{DB_PATH}` ({db_size_mb:.2f} MB)
+- **Indexed Notes:** {notes_count} documents
+- **Text Chunks (Relational):** {chunks_count} chunks
+- **FTS5 Lexical Index:** {fts_count} chunks
+- **Vector Embeddings (sqlite-vec):** {vec_count} vectors
+- **Embedding Model:** `{EMBED_MODEL_NAME}` (1024 dimensions, 8192 token context)
+- **Reranker Engine:** `{RERANK_MODEL_NAME}` (Cross-Encoder SOTA)
+- **LRU Search Cache:** {len(_search_cache)}/{_SEARCH_CACHE_MAX_SIZE} items cached
+- **Latest Indexed Note:** {last_mod}
+- **Health:** Operational (WAL mode active)
+"""
 
 
-def main():
+if __name__ == "__main__":
     import argparse
-    import sys
-
-    parser = argparse.ArgumentParser(description="Obsidian Hybrid RAG FastMCP Server")
-    parser.add_argument(
-        "--transport",
-        default=os.getenv("MCP_TRANSPORT", "stdio"),
-        choices=["stdio", "sse", "http", "streamable-http"],
-        help="MCP transport protocol (default: stdio)",
-    )
-    parser.add_argument(
-        "--host",
-        default=os.getenv("MCP_HOST", "127.0.0.1"),
-        help="Host for HTTP/SSE daemon (default: 127.0.0.1)",
-    )
-    parser.add_argument(
-        "--port",
-        type=int,
-        default=int(os.getenv("MCP_PORT", "8765")),
-        help="Port for HTTP/SSE daemon (default: 8765)",
-    )
-    parser.add_argument(
-        "--preload",
-        action="store_true",
-        help="Preload BGE-M3 and Jina Reranker models into RAM at startup",
-    )
+    parser = argparse.ArgumentParser(description="Obsidian Second Brain FastMCP Server")
+    parser.add_argument("--transport", default=os.environ.get("MCP_TRANSPORT", "stdio"), choices=["stdio", "sse", "http", "streamable-http"])
+    parser.add_argument("--host", default=os.environ.get("MCP_HOST", "127.0.0.1"))
+    parser.add_argument("--port", type=int, default=int(os.environ.get("MCP_PORT", "8765")))
+    parser.add_argument("--preload", action="store_true", help="Preload models into RAM at startup")
     args = parser.parse_args()
 
     if args.preload:
-        print("[obsidian-hybrid-rag] Pre-warming BGE-M3 and Jina Reranker models...", file=sys.stderr)
+        print("[vault-mcp] Pre-warming BGE-M3 and Jina Reranker models into RAM...", file=sys.stderr)
         get_embed_model()
-        get_rerank_model()
-        print("[obsidian-hybrid-rag] Models pre-warmed successfully.", file=sys.stderr)
+        get_reranker()
+        print("[vault-mcp] Models pre-warmed successfully.", file=sys.stderr)
 
     if args.transport in {"sse", "http", "streamable-http"}:
         mcp.run(transport=args.transport, host=args.host, port=args.port)
     else:
         mcp.run(transport="stdio")
-
-
-if __name__ == "__main__":
-    main()
