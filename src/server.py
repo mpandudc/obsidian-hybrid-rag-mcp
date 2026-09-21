@@ -8,11 +8,14 @@ Includes in-memory LRU search cache and instant background re-indexing on write.
 
 import os
 import re
+import gc
 import sys
 import time
 import struct
+import ctypes
 import sqlite3
 import warnings
+import threading
 import subprocess
 from pathlib import Path
 from typing import Optional
@@ -38,6 +41,40 @@ RERANK_MODEL_NAME = "jinaai/jina-reranker-v2-base-multilingual"
 mcp = FastMCP("vault")
 _embed_model = None
 _reranker = None
+
+# Model idle auto-unload management (drops RAM footprint when idle)
+MODEL_IDLE_TIMEOUT = int(os.environ.get("MODEL_IDLE_TIMEOUT", "300"))
+_unload_timer: Optional[threading.Timer] = None
+_model_lock = threading.Lock()
+_last_search_at: Optional[float] = None
+
+
+def _unload_models():
+    global _embed_model, _reranker, _unload_timer
+    with _model_lock:
+        if _embed_model is None and _reranker is None:
+            _unload_timer = None
+            return
+        _embed_model = None
+        _reranker = None
+        _unload_timer = None
+    gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+    print("[vault-mcp] Models unloaded due to idle timeout; RAM trimmed to OS.", file=sys.stderr)
+
+
+def schedule_model_unload():
+    global _unload_timer, _last_search_at
+    _last_search_at = time.time()
+    with _model_lock:
+        if _unload_timer is not None:
+            _unload_timer.cancel()
+        _unload_timer = threading.Timer(MODEL_IDLE_TIMEOUT, _unload_models)
+        _unload_timer.daemon = True
+        _unload_timer.start()
 
 # In-memory LRU Cache for search results (Improvement C)
 _SEARCH_CACHE_MAX_SIZE = 128
@@ -84,32 +121,37 @@ def trigger_background_reindex():
 
 def get_embed_model():
     global _embed_model
-    if _embed_model is None:
-        import torch
-        from sentence_transformers import SentenceTransformer
-        torch.set_num_threads(4)
-        _embed_model = SentenceTransformer(EMBED_MODEL_NAME, device="cpu", local_files_only=True)
+    with _model_lock:
+        if _embed_model is None:
+            import torch
+            from sentence_transformers import SentenceTransformer
+            torch.set_num_threads(4)
+            _embed_model = SentenceTransformer(EMBED_MODEL_NAME, device="cpu", local_files_only=True)
+    schedule_model_unload()
     return _embed_model
 
 
 def get_reranker():
     global _reranker
-    if _reranker is None:
-        from fastembed.rerank.cross_encoder import TextCrossEncoder
-        _reranker = TextCrossEncoder(
-            RERANK_MODEL_NAME,
-            cache_dir="/home/mpandudc/.cache/fastembed",
-            local_files_only=True,
-            threads=2
-        )
+    with _model_lock:
+        if _reranker is None:
+            from fastembed.rerank.cross_encoder import TextCrossEncoder
+            _reranker = TextCrossEncoder(
+                RERANK_MODEL_NAME,
+                cache_dir="/home/mpandudc/.cache/fastembed",
+                local_files_only=True,
+                threads=2
+            )
+    schedule_model_unload()
     return _reranker
 
 
-def get_db_connection():
+def get_db_connection(db_path: Optional[Path] = None):
     import sqlite_vec
-    if not DB_PATH.exists():
-        raise FileNotFoundError(f"Vault index database not found at {DB_PATH}")
-    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+    target_path = db_path or DB_PATH
+    if not target_path.exists():
+        raise FileNotFoundError(f"Vault index database not found at {target_path}")
+    conn = sqlite3.connect(f"file:{target_path}?mode=ro", uri=True)
     conn.enable_load_extension(True)
     sqlite_vec.load(conn)
     conn.enable_load_extension(False)
@@ -117,8 +159,15 @@ def get_db_connection():
     return conn
 
 
+def get_db(db_path_str: str):
+    return get_db_connection(Path(db_path_str).expanduser().resolve())
+
+
 def serialize_vector(vec):
     return struct.pack(f"{len(vec)}f", *vec)
+
+
+serialize_f32 = serialize_vector
 
 
 @mcp.tool()
@@ -137,6 +186,8 @@ def vault_search(query: str, limit: int = 5, mode: str = "hybrid", folder: str =
 
     cached_res = cache_get(cache_key)
     if cached_res is not None:
+        if _embed_model is not None or _reranker is not None:
+            schedule_model_unload()
         return cached_res
 
     conn = get_db_connection()
@@ -264,6 +315,8 @@ def vault_search(query: str, limit: int = 5, mode: str = "hybrid", folder: str =
 
     res = "\n---\n".join(results)
     cache_set(cache_key, res)
+    if _embed_model is not None or _reranker is not None:
+        schedule_model_unload()
     return res
 
 
@@ -455,6 +508,15 @@ def vault_status() -> str:
     last_note = conn.execute("SELECT rel_path, mtime FROM notes ORDER BY mtime DESC LIMIT 1").fetchone()
     last_mod = f"`{last_note['rel_path']}`" if last_note else "None"
 
+    model_loaded = _embed_model is not None or _reranker is not None
+    if model_loaded and _last_search_at:
+        remaining = max(0, int(MODEL_IDLE_TIMEOUT - (time.time() - _last_search_at)))
+        model_status_str = f"Loaded in RAM (auto-unload in {remaining}s)"
+    elif model_loaded:
+        model_status_str = "Loaded in RAM (idle timer active)"
+    else:
+        model_status_str = "Unloaded (0 MB idle RAM overhead)"
+
     return f"""### 🧠 Obsidian Second Brain Index Status
 - **Vault Path:** `{VAULT_PATH}`
 - **Database Path:** `{DB_PATH}` ({db_size_mb:.2f} MB)
@@ -464,6 +526,7 @@ def vault_status() -> str:
 - **Vector Embeddings (sqlite-vec):** {vec_count} vectors
 - **Embedding Model:** `{EMBED_MODEL_NAME}` (1024 dimensions, 8192 token context)
 - **Reranker Engine:** `{RERANK_MODEL_NAME}` (Cross-Encoder SOTA)
+- **Model Memory Status:** {model_status_str}
 - **LRU Search Cache:** {len(_search_cache)}/{_SEARCH_CACHE_MAX_SIZE} items cached
 - **Latest Indexed Note:** {last_mod}
 - **Health:** Operational (WAL mode active)
@@ -476,14 +539,7 @@ if __name__ == "__main__":
     parser.add_argument("--transport", default=os.environ.get("MCP_TRANSPORT", "stdio"), choices=["stdio", "sse", "http", "streamable-http"])
     parser.add_argument("--host", default=os.environ.get("MCP_HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=int(os.environ.get("MCP_PORT", "8765")))
-    parser.add_argument("--preload", action="store_true", help="Preload models into RAM at startup")
     args = parser.parse_args()
-
-    if args.preload:
-        print("[vault-mcp] Pre-warming BGE-M3 and Jina Reranker models into RAM...", file=sys.stderr)
-        get_embed_model()
-        get_reranker()
-        print("[vault-mcp] Models pre-warmed successfully.", file=sys.stderr)
 
     if args.transport in {"sse", "http", "streamable-http"}:
         mcp.run(transport=args.transport, host=args.host, port=args.port)
