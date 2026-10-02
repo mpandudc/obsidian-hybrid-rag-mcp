@@ -61,7 +61,7 @@ Engineered with **SOTA dual-model AI** (`BAAI/bge-m3` 1024-dim dense embeddings 
    - Native C-extension vector similarity via `sqlite-vec`. Zero Docker containers, zero network ports, zero external vector service management.
 
 2. **State-of-the-Art Dual-Model Pipeline**:
-   - **Dense Bi-Encoder**: `BAAI/bge-m3` (1024 dimensions, 8,192 token context window, multi-lingual SOTA).
+   - **Dense Bi-Encoder**: `BAAI/bge-m3` (1024 dimensions, multilingual). The model supports 8,192 tokens, but the indexer caps `max_seq_length` at 1,024 because attention memory grows quadratically on CPU.
    - **Cross-Encoder Reranker**: `jinaai/jina-reranker-v2-base-multilingual` executed via FastEmbed ONNX Runtime with 2 execution threads.
 
 3. **Heading-Aware Hierarchy Chunking**:
@@ -75,8 +75,14 @@ Engineered with **SOTA dual-model AI** (`BAAI/bge-m3` 1024-dim dense embeddings 
    - **Fusion**: RRF ($score = \sum \frac{1}{60 + rank}$) merges candidates into the top 15 pool.
    - **Stage 2**: Cross-encoder computes pairwise joint attention between the query and candidate passages, returning precision-ranked results.
 
-5. **Sub-millisecond IPC**:
-   - FastMCP Stdio communication with JSON-RPC over stdin/stdout. Zero HTTP overhead.
+5. **Safe vault editing for agents**:
+   - Write tools are confined to the vault (path traversal and hidden folders rejected), return a `[[wikilink]]` report (broken links, missing hub link) and trigger a background re-index.
+   - `vault_edit` gives agents an exact-string replace so they never need `patch`/`sed` on vault files.
+
+6. **Memory-safe indexing**:
+   - Oversized paragraphs are split by lines / hard-sliced (no chunk above `VAULT_CHUNK_CHAR_LIMIT`, default 2,500 chars).
+   - One transaction per note: an interrupted run keeps its progress.
+   - Run the indexer in a memory-capped cgroup in production (see below).
 
 ---
 
@@ -88,7 +94,9 @@ Tested on Linux x86_64, 4 vCPU (Intel Xeon / AMD EPYC), 4 GB RAM:
 |---|---|---|
 | **Query Latency (Stage 1 Hybrid)** | **~28 ms** | FTS5 BM25 + sqlite-vec 1024-dim |
 | **Query Latency (Stage 2 Rerank)** | **~245 ms** | Jina Reranker v2 ONNX 15 candidates |
-| **End-to-End Query Latency** | **< 280 ms** | Cold cache to final JSON response |
+| **End-to-End Query Latency** | **< 280 ms** | Models already loaded (warm) |
+| **Cold model load** | **~3-30 s** | First semantic query after idle unload; depends on CPU contention |
+| **Keyword mode** | **< 10 ms** | FTS5 only, no model load |
 | **Incremental Sync Time** | **< 0.1 s** | Unmodified notes bypassed via SHA256 hashes |
 | **Peak Inference Memory (RSS)** | **~2.4 GB** | PyTorch CPU (BGE-M3) + FastEmbed ONNX |
 | **Indexing Throughput** | **~8-10 chunks/sec** | 4-thread CPU batch matrix computation |
@@ -119,14 +127,21 @@ uv pip install -e .
 
 ### 3. Environment Configuration
 
-Create a `.env` or set environment variables:
+| Variable | Default | Purpose |
+|---|---|---|
+| `OBSIDIAN_VAULT_PATH` (or `VAULT_PATH`) | `~/vaults/pandu-second-brain` | Vault root |
+| `VAULT_INDEX_DB` (or `INDEX_DB_PATH`) | `~/.hermes/vault-index.db` | SQLite index file |
+| `VAULT_INDEXER_COMMAND` | `flock -n /tmp/vault-indexer.lock python -m src.indexer ...` | Command run after every write tool (point it at a memory-capped wrapper) |
+| `VAULT_MAX_CHUNKS_PER_NOTE` | `2` | Result diversity cap per note |
+| `MODEL_IDLE_TIMEOUT` | `300` | Seconds before models are unloaded from RAM |
+| `VAULT_CHUNK_CHAR_LIMIT` | `2500` | Indexer: max characters per chunk |
+| `VAULT_EMBED_MAX_SEQ_LENGTH` | `1024` | Indexer: token cap per chunk for bge-m3 |
+| `VAULT_EMBED_BATCH_SIZE` | `8` | Indexer: encode batch size |
+| `FASTEMBED_CACHE_DIR` | `~/.cache/fastembed` | Reranker model cache |
 
 ```bash
-# Path to your local Obsidian vault root
-export VAULT_PATH="/path/to/your/obsidian-vault"
-
-# Path to the persistent SQLite index database
-export INDEX_DB_PATH="$HOME/.config/obsidian-mcp/vault-index.db"
+export OBSIDIAN_VAULT_PATH="/path/to/your/obsidian-vault"
+export VAULT_INDEX_DB="$HOME/.config/obsidian-mcp/vault-index.db"
 ```
 
 ### 4. Build Initial Index
@@ -174,11 +189,11 @@ hermes mcp add vault --command "/path/to/obsidian-hybrid-rag-mcp/.venv/bin/pytho
 ```
 
 **Shared SSE Daemon Mode (Recommended for Multi-Agent setups):**
-Run as a background daemon or systemd service to keep models pre-warmed and share a single ~2.1 GB RAM footprint across multiple profiles or sessions:
+Run one daemon so every profile/session shares a single model copy (loaded lazily, unloaded after `MODEL_IDLE_TIMEOUT`):
 ```bash
-# Start daemon listening on SSE
-vault-mcp --transport sse --host 127.0.0.1 --port 8765 --preload
+vault-mcp --transport sse --host 127.0.0.1 --port 8765
 ```
+> **Security:** the write tools have no authentication. Keep `--host 127.0.0.1` (the default); the server prints a warning if bound elsewhere.
 
 Register with Hermes:
 ```bash
@@ -194,7 +209,8 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/path/to/.venv/bin/python -m src.server --transport sse --host 127.0.0.1 --port 8765 --preload
+ExecStart=/path/to/.venv/bin/python -m src.server --transport sse --host 127.0.0.1 --port 8765
+Environment=VAULT_INDEXER_COMMAND=/path/to/run-vault-indexer.sh
 Restart=always
 RestartSec=5
 
@@ -206,24 +222,24 @@ WantedBy=default.target
 
 ## 🛠️ MCP Tools Exposed
 
-### 1. `search_vault`
-Executes Two-Stage Hybrid RAG query across your notes.
-- **Parameters**:
-  - `query` (*string*, required): Natural language question or search phrase.
-  - `top_k` (*integer*, default: `5`): Number of highest-ranked passages.
-  - `heading_filter` (*string*, optional): Substring filter for specific note headings (e.g. `Architecture`, `Runbook`).
-- **Response**: Array of candidate objects with `title`, `rel_path`, `heading`, `lines`, `relevance_score`, and markdown `text`.
+| Tool | Purpose |
+|---|---|
+| `vault_search(query, limit=5, mode="hybrid", folder="")` | Hybrid BM25 + bge-m3 + cross-encoder search. `mode`: `hybrid` / `keyword` (instant, no model) / `semantic`. Stopwords (ID/EN) dropped from the BM25 query, folder filter oversamples vector KNN, max 2 chunks per note. |
+| `vault_read(rel_path, heading="")` | Full note or one heading section. Unique bare names resolve; ambiguous names return candidates. |
+| `vault_list(folder="", limit=200)` | Notes and titles under a folder. |
+| `vault_backlinks(note, limit=50)` | Notes linking to a note, with the linking line. |
+| `vault_write(rel_path, content, title="", tags="")` | Create/overwrite with frontmatter (`created`/`updated`). |
+| `vault_append(rel_path, content, heading="")` | Append at the end or under a heading (heading created if missing). |
+| `vault_edit(rel_path, old_text, new_text, replace_all=False)` | Exact-string replace; refuses missing or ambiguous matches. |
+| `vault_status()` | `OK` / `INDEXING` / `STALE` (with pending notes) / `INCONSISTENT`, counts, last index write, model RAM state. |
 
-### 2. `get_note`
-Reads full note content with line numbering and bounded pagination to prevent context window overflow.
-- **Parameters**:
-  - `rel_path` (*string*, required): Relative note path (e.g., `projects/cuantum.md`).
-  - `offset_line` (*integer*, default: `1`): Start line number.
-  - `limit_lines` (*integer*, default: `250`): Maximum lines to return.
+Write tools return a link report, clear the search cache and trigger `VAULT_INDEXER_COMMAND`. The search cache is also keyed on the index DB mtime, so results never outlive an indexer commit.
 
-### 3. `sync_vault`
-Triggers incremental background synchronization to detect newly modified or deleted notes.
-- **Parameters**: None.
+### Production memory cap (systemd)
+
+```bash
+flock -n /tmp/vault-indexer.lock   systemd-run --user --scope --quiet -p MemoryMax=3G -p MemorySwapMax=512M -p CPUQuota=150% --nice=10   python -m src.indexer
+```
 
 ---
 

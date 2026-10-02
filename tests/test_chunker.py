@@ -1,5 +1,20 @@
-import pytest
-from src.chunker import chunk_markdown, clean_frontmatter, extract_summary, extract_title
+from src.chunker import chunk_markdown, clean_frontmatter, extract_summary, extract_title, split_oversized
+
+
+def test_split_oversized_bounds_every_piece():
+    one_line = "x" * 6000
+    assert [len(p) for p in split_oversized(one_line, 2500)] == [2500, 2500, 1000]
+    many_lines = "\n".join("word " * 100 for _ in range(50))  # one paragraph, no blank lines
+    pieces = split_oversized(many_lines, 2500)
+    assert len(pieces) > 1 and all(len(p) <= 2500 for p in pieces)
+    assert split_oversized("short", 2500) == ["short"]
+
+
+def test_chunk_markdown_caps_giant_paragraph():
+    giant = "# Title\n\n## Section\n\n" + "\n".join("kalimat " * 60 for _ in range(300))
+    chunks = chunk_markdown(giant, title="Title", summary="", chunk_char_limit=2500)
+    assert len(chunks) > 10
+    assert max(len(c.text) for c in chunks) <= 2500
 
 
 def test_clean_frontmatter():
