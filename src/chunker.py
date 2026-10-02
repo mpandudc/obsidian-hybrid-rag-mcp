@@ -4,9 +4,9 @@ Preserves hierarchy, YAML frontmatter, wikilinks, and line-level traceability.
 """
 
 from __future__ import annotations
+
 import re
 from dataclasses import dataclass
-from typing import List, Optional
 
 
 @dataclass
@@ -52,21 +52,50 @@ def extract_summary(content: str, max_chars: int = 280) -> str:
     return summary[:max_chars] + "..." if len(summary) > max_chars else summary
 
 
+def split_oversized(text: str, limit: int) -> list[str]:
+    """Split a paragraph longer than `limit` by lines, then hard-slice any single overlong line.
+
+    Guarantees every piece is <= limit, so one giant paragraph (no blank lines) can never
+    become a single huge chunk that blows up embedding memory.
+    """
+    if len(text) <= limit:
+        return [text]
+    pieces: list[str] = []
+    buf: list[str] = []
+    buf_len = 0
+    for line in text.splitlines():
+        while len(line) > limit:
+            if buf:
+                pieces.append("\n".join(buf))
+                buf, buf_len = [], 0
+            pieces.append(line[:limit])
+            line = line[limit:]
+        if buf_len + len(line) + 1 > limit and buf:
+            pieces.append("\n".join(buf))
+            buf, buf_len = [], 0
+        buf.append(line)
+        buf_len += len(line) + 1
+    if buf:
+        pieces.append("\n".join(buf))
+    return pieces
+
+
 def chunk_markdown(
     content: str,
     title: str,
     summary: str,
-    chunk_char_limit: int = 1200,
+    chunk_char_limit: int = 2500,
     min_chunk_chars: int = 30,
-) -> List[MarkdownChunk]:
+) -> list[MarkdownChunk]:
     """
     Split markdown document by natural headings (# through ####).
-    If a section exceeds chunk_char_limit, it gracefully splits on double-newlines (paragraphs).
+    If a section exceeds chunk_char_limit, it splits on double-newlines (paragraphs);
+    paragraphs that are still too long are split by lines / hard-sliced (split_oversized).
     """
     lines = content.splitlines()
-    raw_chunks: List[dict] = []
+    raw_chunks: list[dict] = []
     current_heading = "Overview"
-    current_lines: List[str] = []
+    current_lines: list[str] = []
     start_line = 1
 
     heading_regex = re.compile(r"^(#{1,4})\s+(.+)$")
@@ -99,7 +128,7 @@ def chunk_markdown(
             })
 
     # Subdivide large chunks while preserving line offsets
-    final_chunks: List[MarkdownChunk] = []
+    final_chunks: list[MarkdownChunk] = []
     for c in raw_chunks:
         if len(c["text"]) <= chunk_char_limit:
             final_chunks.append(
@@ -113,8 +142,10 @@ def chunk_markdown(
                 )
             )
         else:
-            paragraphs = c["text"].split("\n\n")
-            sub_buf: List[str] = []
+            paragraphs = [
+                piece for para in c["text"].split("\n\n") for piece in split_oversized(para, chunk_char_limit)
+            ]
+            sub_buf: list[str] = []
             current_len = 0
             sub_start = c["line_start"]
             for p in paragraphs:
