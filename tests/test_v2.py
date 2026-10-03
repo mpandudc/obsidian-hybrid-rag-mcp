@@ -360,3 +360,21 @@ def test_eval_metrics(vault, tmp_path):
     assert abs(r["hit_at_k"] - 2 / 3) < 1e-9 and abs(r["mrr"] - 2 / 3) < 1e-9
     assert r["misses"][0]["query"] == "zzzz qqqq"
     assert "| keyword | 0.67 |" in vault_eval.format_report([r])
+
+
+def test_notes_linked_from_readme_count_as_hubs(vault):
+    root = vault["root"]
+    (root / "README.md").write_text("# Hub\n\n[[homeserver-setup]] [[cuantum-overview]] [[project-status]]\n",
+                                    encoding="utf-8")
+    (root / "project-status.md").write_text("# Status\n\n[[README]]\n", encoding="utf-8")
+    (root / "child.md").write_text("# Child\n\nPart of [[project-status]].\n", encoding="utf-8")
+    no_hub = vault["server"].lint_vault(root).no_hub
+    assert "child.md" not in no_hub and "project-status.md" not in no_hub
+    assert "Link check: OK" in call(vault["server"].vault_write, "child2.md", "# C2\n\nSee [[project-status]].\n")
+
+
+def test_move_skips_links_in_inline_code(vault):
+    root = vault["root"]
+    (root / "doc.md").write_text("# Doc\n\n[[README]] `[[cuantum-overview]]` [[cuantum-overview]]\n", encoding="utf-8")
+    call(vault["server"].vault_move, "cuantum-overview", "projects/cuantum/co2.md")
+    assert (root / "doc.md").read_text(encoding="utf-8") == "# Doc\n\n[[README]] `[[cuantum-overview]]` [[co2]]\n"

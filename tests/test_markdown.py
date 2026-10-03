@@ -102,3 +102,7 @@ def test_short_note_still_produces_a_chunk():
     assert len(chunks) == 1 and "momentum alpha" in chunks[0].text
     long_note = "# T\n\n## Tiny\n\nx\n\n## Real\n\n" + "real content " * 10
     assert [c.heading for c in chunk_markdown(long_note, "T", "")] == ["Real"]
+
+
+def test_wikilinks_in_inline_code_are_ignored():
+    assert link_targets("Use `[[link]]` syntax, see [[README]] and ``[[x]]``.") == ["README"]

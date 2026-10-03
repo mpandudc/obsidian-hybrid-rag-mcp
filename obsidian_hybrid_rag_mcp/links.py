@@ -19,11 +19,12 @@ from obsidian_hybrid_rag_mcp.markdown import (
     iter_code_mask,
     iter_wikilinks,
     link_targets,
+    mask_inline_code,
     parse_frontmatter,
 )
 from obsidian_hybrid_rag_mcp.vaultfs import HIDDEN_DIRS, iter_notes
 
-DEFAULT_STATUS_VALUES = "draft,active,approved,verified,completed,falsified,superseded,archived"
+DEFAULT_STATUS_VALUES = "draft,active,blocked,approved,verified,completed,falsified,superseded,archived"
 
 
 def is_hub(rel_or_target: str) -> bool:
@@ -51,6 +52,24 @@ class LinkIndex:
             self.by_stem[noext.rsplit("/", 1)[-1]].append(rel)
         for paths in self.by_stem.values():
             paths.sort(key=lambda p: (p.count("/"), p))
+        # Notes linked from the root README (the vault's map of content) are hubs too.
+        self.moc: set[str] = set()
+        readme = self.by_path.get("readme")
+        if readme:
+            try:
+                text = (vault / readme).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                text = ""
+            self.moc = {r for r in (self.resolve(t) for t in link_targets(text)) if r}
+
+    def is_hub_note(self, rel: str) -> bool:
+        return is_hub(rel) or rel in self.moc
+
+    def is_hub_target(self, target: str) -> bool:
+        if is_hub(target):
+            return True
+        rel = self.resolve(target)
+        return rel is not None and rel in self.moc
 
     def resolve(self, target: str) -> str | None:
         """Note rel path for a link target, or None (attachments resolve to None too)."""
@@ -83,7 +102,7 @@ def link_report(vault: Path, content: str, rel_path: str) -> str:
     notes = []
     if not targets:
         notes.append("no [[wikilinks]] at all — link the note to its hub and related notes")
-    elif not is_hub(rel_path) and not any(is_hub(t) for t in targets):
+    elif not index.is_hub_note(rel_path) and not any(index.is_hub_target(t) for t in targets):
         notes.append("no link to a hub note ([[README]], an *INDEX note, or a project *overview*)")
     if broken:
         notes.append("broken links (no matching note): " + ", ".join(f"[[{b}]]" for b in broken))
@@ -153,7 +172,7 @@ def lint_vault(vault: Path, folder: str = "", status_values: set[str] | None = N
         if not in_scope:
             continue
         report.total += 1
-        if not is_hub(rel) and not any(is_hub(t) for t in targets):
+        if not index.is_hub_note(rel) and not any(index.is_hub_target(t) for t in targets):
             report.no_hub.append(rel)
         if not frontmatter_span(lines):
             report.no_frontmatter.append(rel)
@@ -181,7 +200,7 @@ def _new_target(old_target: str, new_rel: str, index_after: LinkIndex) -> str:
 
 def rewrite_links(text: str, old_rel: str, new_rel: str, index_before: LinkIndex,
                   index_after: LinkIndex) -> tuple[str, int]:
-    """Point every wikilink that resolved to `old_rel` at `new_rel` (code fences untouched)."""
+    """Point every wikilink that resolved to `old_rel` at `new_rel` (fenced and inline code untouched)."""
     lines = text.split("\n")
     count = 0
     code = dict(iter_code_mask(lines))
@@ -195,6 +214,12 @@ def rewrite_links(text: str, old_rel: str, new_rel: str, index_before: LinkIndex
         return f"{m.group(1)}[[{target}{m.group(3) or ''}{m.group(4) or ''}]]"
 
     for i, line in enumerate(lines):
-        if not code.get(i) and "[[" in line:
-            lines[i] = WIKILINK_RE.sub(repl, line)
+        if code.get(i) or "[[" not in line:
+            continue
+        out, pos = [], 0
+        for m in WIKILINK_RE.finditer(mask_inline_code(line)):
+            out.append(line[pos:m.start()])
+            out.append(repl(WIKILINK_RE.match(line, m.start())))
+            pos = m.end()
+        lines[i] = "".join(out) + line[pos:]
     return "\n".join(lines), count
