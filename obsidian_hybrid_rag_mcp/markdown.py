@@ -15,6 +15,12 @@ import yaml
 FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)(?:\s+#+)?\s*$")
 WIKILINK_RE = re.compile(r"(!?)\[\[([^\]|#^]+)([#^][^\]|]*)?(\|[^\]]*)?\]\]")
+INLINE_CODE_RE = re.compile(r"(`+)(.+?)\1")
+
+
+def mask_inline_code(line: str) -> str:
+    """Blank out `inline code` spans (same length, so match offsets stay valid)."""
+    return INLINE_CODE_RE.sub(lambda m: " " * len(m.group(0)), line)
 
 
 def frontmatter_span(lines: list[str]) -> int:
@@ -106,7 +112,7 @@ def list_headings(lines: list[str]) -> list[str]:
 
 
 def iter_wikilinks(content: str) -> Iterator[tuple[int, re.Match]]:
-    """Yield (line_index, match) for wikilinks outside fenced code.
+    """Yield (line_index, match) for wikilinks outside fenced and inline code.
 
     Match groups: 1 embed '!', 2 target, 3 '#heading' / '^block', 4 '|alias'.
     """
@@ -114,7 +120,7 @@ def iter_wikilinks(content: str) -> Iterator[tuple[int, re.Match]]:
     for i, in_code in iter_code_mask(lines):
         if in_code:
             continue
-        for m in WIKILINK_RE.finditer(lines[i]):
+        for m in WIKILINK_RE.finditer(mask_inline_code(lines[i])):
             yield i, m
 
 

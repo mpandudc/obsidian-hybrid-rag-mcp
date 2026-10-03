@@ -28,6 +28,6 @@
 - Indexer skip rules: `.vaultignore`, `VAULT_MAX_FILE_BYTES`, frontmatter `index: false`; overlong lines (`VAULT_MAX_LINE_CHARS`) are dropped from indexed text. Skipped notes are listed by `vault_status`.
 - `vault_search` filters `tags` and `status`.
 - Optional reranker score floor `VAULT_MIN_RERANK_SCORE`.
-- Tools: `vault_lint`, `vault_move` (rewrites links), `vault_recent`.
+- Tools: `vault_lint`, `vault_move` (rewrites links), `vault_recent`. Notes linked from the root README count as hubs; `[[links]]` inside inline code are ignored (as in Obsidian); `blocked` is an allowed status.
 - `vault-eval` retrieval evaluation (hit@k, recall@k, MRR, rerank score distribution) and an example golden set.
 - CI on Ubuntu and Windows, ruff configuration.
