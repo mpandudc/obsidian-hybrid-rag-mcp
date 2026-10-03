@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- A missing or broken embedding / reranker model made `semantic` and `hybrid` search silently fall back to keyword hits or RRF order. Results now end with a warning naming the failure, degraded results are not cached, and `vault_status` lists the unavailable model with its error until it loads again.
+
 ## 2.0.0
 
 ### Fixed
