@@ -383,12 +383,40 @@ def _after_change(rel: str, content: str) -> str:
 # Search
 # ---------------------------------------------------------------------------
 
+# Last model failure per stage ("ExcType: message"), cleared on the next success.
+# search() falls back silently, so these are what tell the agent and vault_status.
+_model_errors: dict[str, str] = {}
+_call = threading.local()  # failures during the current vault_search call
+
+
+def _tracked(stage: str, fn):
+    try:
+        result = fn()
+    except Exception as e:
+        _model_errors[stage] = f"{type(e).__name__}: {e}"
+        getattr(_call, "failures", {})[stage] = _model_errors[stage]
+        raise
+    _model_errors.pop(stage, None)
+    return result
+
+
 def _embed_query(query: str) -> bytes:
-    return serialize_f32(get_embed_model().encode([query], normalize_embeddings=True)[0])
+    return _tracked("embedder", lambda: serialize_f32(
+        get_embed_model().encode([query], normalize_embeddings=True)[0]))
 
 
 def _rerank(query: str, docs: list[str]) -> list[float]:
-    return list(get_reranker().rerank(query, docs))
+    return _tracked("reranker", lambda: list(get_reranker().rerank(query, docs)))
+
+
+def _degradation_note(failures: dict[str, str]) -> str:
+    """Footer for results produced without a model the requested mode needed."""
+    notes = []
+    if "embedder" in failures:
+        notes.append(f"semantic search unavailable ({failures['embedder']}); keyword results only")
+    if "reranker" in failures:
+        notes.append(f"reranker unavailable ({failures['reranker']}); RRF order")
+    return ("\n\n> ⚠️ " + " · ".join(notes)) if notes else ""
 
 
 @mcp.tool()
@@ -418,6 +446,7 @@ def vault_search(query: str, limit: int = 5, mode: str = "hybrid", folder: str =
             schedule_model_unload()
         return cached_res
 
+    _call.failures = {}
     conn = get_db_connection()
     try:
         outcome = search(
@@ -427,6 +456,8 @@ def vault_search(query: str, limit: int = 5, mode: str = "hybrid", folder: str =
         )
     finally:
         conn.close()
+    failures, _call.failures = _call.failures, {}
+    note = _degradation_note(failures)
 
     if not outcome.hits:
         if outcome.best_rejected_score is not None:
@@ -434,6 +465,8 @@ def vault_search(query: str, limit: int = 5, mode: str = "hybrid", folder: str =
                    f"{outcome.best_rejected_score:.2f} < floor {MIN_RERANK_SCORE}). Try other words or mode='keyword'.")
         else:
             res = f"No matching notes found in vault for query: '{query}'."
+        if note:  # degraded answers are not cached: a recovered model answers properly next time
+            return res + note
         cache_set(cache_key, res)
         return res
 
@@ -448,7 +481,10 @@ def vault_search(query: str, limit: int = 5, mode: str = "hybrid", folder: str =
         results.append(f"{header}\n{meta}\n\n{snippet}\n")
 
     res = "\n---\n".join(results)
-    cache_set(cache_key, res)
+    if note:
+        res += note
+    else:
+        cache_set(cache_key, res)
     if _embed_model is not None or _reranker is not None:
         schedule_model_unload()
     return res
@@ -898,13 +934,17 @@ def vault_status() -> str:
         worker = f"\n- **Last in-process index:** {_worker.last_error or _worker.last_stats}"
     last_write_str = f"{age_min:.0f} min ago" if age_min is not None else "never"
     floor = "off" if MIN_RERANK_SCORE is None else MIN_RERANK_SCORE
+    model_errors = "".join(
+        f"\n- ⚠️ {label}: unavailable — {_model_errors[stage]}"
+        for stage, label in (("embedder", "Embedder"), ("reranker", "Reranker")) if stage in _model_errors
+    )
 
     return f"""### Vault Index Status
 - **Health:** {health}
 - **Indexed:** {notes_count} notes, {chunks_count} chunks, {vec_count} vectors ({db_size_mb:.1f} MB){skipped_list}
 - **Last index write:** {last_write_str}
 - **Indexer running:** {'yes' if running else 'no'} (mode: {INDEX_MODE}){pending_list}{worker}
-- **Models:** `{EMBED_MODEL_NAME}` + `{RERANK_MODEL_NAME}` — {model_status_str}; rerank floor: {floor}
+- **Models:** `{EMBED_MODEL_NAME}` + `{RERANK_MODEL_NAME}` — {model_status_str}; rerank floor: {floor}{model_errors}
 - **Search cache:** {len(_search_cache)}/{_SEARCH_CACHE_MAX_SIZE}
 """
 

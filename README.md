@@ -218,6 +218,16 @@ vault-eval --golden eval/golden.json --k 5
 
 It prints hit@k / recall@k / MRR per mode, every miss, and the reranker score distribution of relevant vs irrelevant results. Use the relevant-score p10 to pick `VAULT_MIN_RERANK_SCORE`, and re-run after changing chunk size, weights or models.
 
+Reference run on the author's vault (233 notes, 30 queries from `eval/golden.example.json`, k=5):
+
+| mode | hit@5 | recall@5 | MRR |
+|---|---|---|---|
+| keyword | 0.97 | 0.95 | 0.79 |
+| semantic | 1.00 | 1.00 | 0.92 |
+| hybrid (with reranker) | 1.00 | 1.00 | 0.97 |
+
+Relevant results scored −0.90 … 2.01 (p10 0.07); irrelevant ones −3.52 … 1.82 (median 0.01). A floor of `-1.0` kept every relevant hit.
+
 ---
 
 ## 🔁 Upgrading from 1.x

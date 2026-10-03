@@ -378,3 +378,28 @@ def test_move_skips_links_in_inline_code(vault):
     (root / "doc.md").write_text("# Doc\n\n[[README]] `[[cuantum-overview]]` [[cuantum-overview]]\n", encoding="utf-8")
     call(vault["server"].vault_move, "cuantum-overview", "projects/cuantum/co2.md")
     assert (root / "doc.md").read_text(encoding="utf-8") == "# Doc\n\n[[README]] `[[cuantum-overview]]` [[co2]]\n"
+
+
+def test_model_failures_are_reported(vault, monkeypatch):
+    s = vault["server"]
+
+    def broken_reranker():
+        raise RuntimeError("model not in cache_dir")
+
+    def broken_embedder():
+        raise OSError("bge-m3 weights missing")
+
+    monkeypatch.setattr(s, "get_reranker", broken_reranker)
+    res = call(s.vault_search, "nightly vzdump backup", mode="hybrid")
+    assert "homeserver-setup" in res  # still answers from RRF
+    assert "reranker unavailable" in res and "model not in cache_dir" in res
+    assert "Reranker: unavailable — RuntimeError: model not in cache_dir" in call(s.vault_status)
+
+    monkeypatch.setattr(s, "get_embed_model", broken_embedder)
+    res = call(s.vault_search, "vzdump rclone", mode="semantic")
+    assert "semantic search unavailable" in res and "bge-m3 weights missing" in res
+    assert "Embedder: unavailable — OSError: bge-m3 weights missing" in call(s.vault_status)
+
+    monkeypatch.setattr(s, "get_embed_model", lambda: FakeEmbedder())
+    call(s.vault_search, "vzdump rclone backup", mode="semantic")
+    assert "Embedder: unavailable" not in call(s.vault_status)
