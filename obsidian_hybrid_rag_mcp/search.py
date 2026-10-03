@@ -168,8 +168,8 @@ def search(
     rerank_fn: Callable[[str, list[str]], list[float]] | None = None,
     per_note: int = 2,
     min_score: float | None = None,
-    rerank_chars: int = 800,
-    rerank_pool: int = 12,
+    rerank_chars: int = 600,
+    rerank_pool: int = 8,
 ) -> SearchOutcome:
     """Run retrieval. `embed_fn(query) -> float32 blob`; `rerank_fn(query, docs) -> scores`.
     Either may raise: semantic falls back to keyword hits, rerank falls back to RRF order.

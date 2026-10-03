@@ -106,7 +106,9 @@ vault-indexer --vault-path "/path/to/vault"             # incremental
 | `VAULT_EMBED_MAX_SEQ_LENGTH` | `1024` | Token cap per chunk for bge-m3 |
 | `VAULT_EMBED_BATCH_SIZE` | `8` | Encode batch size |
 | `VAULT_MAX_CHUNKS_PER_NOTE` | `2` | Result diversity cap per note |
-| `VAULT_RERANK_CHARS` | chunk limit | Characters of each chunk shown to the reranker |
+| `VAULT_RERANK_CHARS` | `600` | Characters of each candidate shown to the reranker |
+| `VAULT_RERANK_POOL` | `8` | Top RRF candidates reranked (at least `limit`) |
+| `VAULT_RERANK_THREADS` | CPUs in cpuset (max 4) | Reranker ONNX threads |
 | `VAULT_MIN_RERANK_SCORE` | unset (off) | Drop reranked results below this score — calibrate with `vault-eval` |
 | `VAULT_READ_MAX_CHARS` | `8000` | Default `vault_read` page size |
 | `VAULT_STATUS_VALUES` | `draft,active,approved,verified,completed,falsified,superseded,archived` | Allowed frontmatter `status` values for `vault_lint` |
@@ -218,15 +220,17 @@ vault-eval --golden eval/golden.json --k 5
 
 It prints hit@k / recall@k / MRR per mode, every miss, and the reranker score distribution of relevant vs irrelevant results. Use the relevant-score p10 to pick `VAULT_MIN_RERANK_SCORE`, and re-run after changing chunk size, weights or models.
 
-Reference run on the author's vault (233 notes, 30 queries from `eval/golden.example.json`, k=5):
+Reference run on the author's vault (283 notes, 30 queries from `eval/golden.example.json`, k=5, 3 vCPU, no GPU):
 
-| mode | hit@5 | recall@5 | MRR |
+| mode / rerank budget | hit@5 | MRR | avg latency |
 |---|---|---|---|
-| keyword | 0.97 | 0.95 | 0.79 |
-| semantic | 1.00 | 1.00 | 0.92 |
-| hybrid (with reranker) | 1.00 | 1.00 | 0.97 |
+| keyword | 0.97 | 0.77 | 3 ms |
+| semantic | 1.00 | 0.93 | ~0.15 s |
+| hybrid, 20 candidates × 1500 chars | 1.00 | 0.97 | 11.9 s |
+| hybrid, 12 × 800 | 1.00 | 0.93 | 4.8 s |
+| **hybrid, 8 × 600 (default)** | 1.00 | 0.96 | 2.6 s |
 
-Relevant results scored −0.90 … 2.01 (p10 0.07); irrelevant ones −3.52 … 1.82 (median 0.01). A floor of `-1.0` kept every relevant hit.
+The cross-encoder is almost all of hybrid latency on CPU; use `mode="semantic"` when speed matters more than the last few points of ranking. Relevant results scored −0.78 … 2.03 (p10 0.15) with the default budget, so a floor of `-1.0` keeps every relevant hit.
 
 ---
 
