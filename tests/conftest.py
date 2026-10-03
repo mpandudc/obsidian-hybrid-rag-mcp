@@ -31,7 +31,9 @@ NOTES = {
     "projects/cuantum/cuantum-overview.md": (
         "# Cuantum Overview\n\n[[README]]\n\n## Strategy\n\nTrading bot strategy uses funding rate carry.\n"
     ),
-    "projects/cuantum/notes.md": "# Cuantum Notes\n\n[[cuantum-overview]]\n\nRisk limits and position sizing for the bot.\n",
+    "projects/cuantum/notes.md": (
+        "# Cuantum Notes\n\n[[cuantum-overview]]\n\nRisk limits and position sizing for the bot.\n"
+    ),
     "other/notes.md": "# Other Notes\n\n[[README]]\n\nUnrelated gardening notes about tomato plants.\n",
     ".obsidian/secret.md": "# hidden\n",
 }
@@ -48,12 +50,14 @@ def vault(tmp_path, monkeypatch):
     db = tmp_path / "index.db"
     monkeypatch.setenv("OBSIDIAN_VAULT_PATH", str(root))
     monkeypatch.setenv("VAULT_INDEX_DB", str(db))
-    monkeypatch.setenv("VAULT_INDEXER_COMMAND", "true")
+    monkeypatch.setenv("VAULT_INDEX_MODE", "off")
+    monkeypatch.delenv("VAULT_INDEXER_COMMAND", raising=False)
+    monkeypatch.delenv("INDEXER_RUNNER", raising=False)
 
-    from src import indexer
+    from obsidian_hybrid_rag_mcp import indexer
     indexer.build_index(root, db, embedder=FakeEmbedder())
 
-    from src import server
+    from obsidian_hybrid_rag_mcp import server
     server = importlib.reload(server)
     monkeypatch.setattr(server, "get_embed_model", lambda: FakeEmbedder())
 

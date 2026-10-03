@@ -4,7 +4,7 @@ import time
 import pytest
 from conftest import FakeEmbedder, call
 
-from src.server import build_fts_query, diversify, get_db, serialize_f32
+from obsidian_hybrid_rag_mcp.server import build_fts_query, diversify, get_db, serialize_f32
 
 
 def test_serialize_f32():
