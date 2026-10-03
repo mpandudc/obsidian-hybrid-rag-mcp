@@ -403,3 +403,37 @@ def test_model_failures_are_reported(vault, monkeypatch):
     monkeypatch.setattr(s, "get_embed_model", lambda: FakeEmbedder())
     call(s.vault_search, "vzdump rclone backup", mode="semantic")
     assert "Embedder: unavailable" not in call(s.vault_status)
+
+
+def test_rerank_budget_limits_candidates_and_chars(vault):
+    from obsidian_hybrid_rag_mcp.search import search
+    root = vault["root"]
+    for i in range(30):
+        (root / f"bulk{i}.md").write_text(f"# Bulk {i}\n\n[[README]]\n\nbackup note {i} " + "word " * 300 + "\n",
+                                          encoding="utf-8")
+    _reindex(vault)
+    seen = []
+
+    def rerank(query, docs):
+        seen.append(docs)
+        return [float(len(docs) - i) for i in range(len(docs))]
+
+    conn = vault["server"].get_db_connection()
+    out = search(conn, "backup note", limit=3, mode="hybrid", embed_fn=None, rerank_fn=rerank,
+                 rerank_pool=7, rerank_chars=100)
+    assert len(seen[0]) == 7 and all(len(d) <= 100 + 60 for d in seen[0])
+    assert len(out.hits) == 3 and out.reranked
+    seen.clear()
+    search(conn, "backup note", limit=10, mode="hybrid", embed_fn=None, rerank_fn=rerank, rerank_pool=4)
+    assert len(seen[0]) == 10  # never rerank fewer candidates than requested results
+    conn.close()
+
+
+def test_eval_reports_latency(vault, tmp_path):
+    golden = tmp_path / "g.json"
+    golden.write_text('[{"query": "vzdump rclone backup", "expected": ["homeserver-setup"]}]', encoding="utf-8")
+    conn = vault["server"].get_db_connection()
+    r = vault_eval.evaluate(conn, vault_eval.load_golden(golden), "keyword", 3, rerank_pool=5, rerank_chars=300)
+    conn.close()
+    report = vault_eval.format_report([r])
+    assert r["avg_ms"] >= 0 and "| keyword | 1.00 |" in report and "avg ms" in report
