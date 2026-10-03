@@ -18,6 +18,7 @@ jobs:
       - uses: astral-sh/setup-uv@v6
         with:
           python-version: ${{ matrix.python }}
+          activate-environment: true
       # Tests use a fake embedder: the core + dev extras are enough (no torch / models).
       - run: uv pip install -e ".[dev]"
       - run: ruff check .
