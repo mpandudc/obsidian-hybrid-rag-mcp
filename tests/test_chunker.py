@@ -1,4 +1,10 @@
-from src.chunker import chunk_markdown, clean_frontmatter, extract_summary, extract_title, split_oversized
+from obsidian_hybrid_rag_mcp.chunker import (
+    chunk_markdown,
+    clean_frontmatter,
+    extract_summary,
+    extract_title,
+    split_oversized,
+)
 
 
 def test_split_oversized_bounds_every_piece():
