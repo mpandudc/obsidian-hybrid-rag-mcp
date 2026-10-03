@@ -87,10 +87,10 @@ RERANK_MODEL_NAME = "jinaai/jina-reranker-v2-base-multilingual"
 MAX_CHUNKS_PER_NOTE = int(os.environ.get("VAULT_MAX_CHUNKS_PER_NOTE", "2"))
 # Cross-encoder logit floor; unset = no floor. Calibrate with `vault-eval` before enabling.
 MIN_RERANK_SCORE = _env_float("VAULT_MIN_RERANK_SCORE")
-# Cross-encoder budget: rerank cost on CPU is ~linear in candidates x characters
-# (measured on 3 vCPU: 20x1500 chars 13.4 s, 12x800 3.4 s).
-RERANK_CHARS = int(os.environ.get("VAULT_RERANK_CHARS", "800"))
-RERANK_POOL = int(os.environ.get("VAULT_RERANK_POOL", "12"))
+# Cross-encoder budget: rerank cost on CPU is ~linear in candidates x characters.
+# vault-eval on 3 vCPU, 30 queries: 20x1500 MRR 0.97 / 11.9 s, 12x800 0.93 / 4.8 s, 8x600 0.96 / 2.6 s.
+RERANK_CHARS = int(os.environ.get("VAULT_RERANK_CHARS", "600"))
+RERANK_POOL = int(os.environ.get("VAULT_RERANK_POOL", "8"))
 
 
 def _available_cpus() -> int:

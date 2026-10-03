@@ -37,7 +37,7 @@ def is_expected(rel: str, expected: list[str]) -> bool:
 
 
 def evaluate(conn, golden: list[dict], mode: str, k: int, embed_fn: Callable | None = None,
-             rerank_fn: Callable | None = None, rerank_pool: int = 12, rerank_chars: int = 800) -> dict:
+             rerank_fn: Callable | None = None, rerank_pool: int = 8, rerank_chars: int = 600) -> dict:
     hits_at_k = 0
     recall_sum = 0.0
     rr_sum = 0.0
@@ -45,6 +45,9 @@ def evaluate(conn, golden: list[dict], mode: str, k: int, embed_fn: Callable | N
     rel_scores: list[float] = []
     irrel_scores: list[float] = []
     latencies: list[float] = []
+    if golden:  # warm-up: model loading is not query latency
+        search(conn, golden[0]["query"], limit=k, mode=mode, embed_fn=embed_fn, rerank_fn=rerank_fn,
+               rerank_pool=rerank_pool, rerank_chars=rerank_chars)
     for item in golden:
         expected = item["expected"]
         started = time.perf_counter()

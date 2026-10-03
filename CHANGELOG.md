@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Changed
+- Hybrid search reranks only the top `VAULT_RERANK_POOL` (default 8) RRF candidates, each cut to `VAULT_RERANK_CHARS` (default 600, was 1500). On a 3-vCPU host this took hybrid latency from 11.9 s to 2.6 s at MRR 0.96 (was 0.97). Reranker threads follow the process cpuset (`VAULT_RERANK_THREADS`).
+- `vault-eval` reports avg / p95 latency (after a warm-up query) and accepts `--rerank-pool` / `--rerank-chars`.
+
 ### Fixed
 - A missing or broken embedding / reranker model made `semantic` and `hybrid` search silently fall back to keyword hits or RRF order. Results now end with a warning naming the failure, degraded results are not cached, and `vault_status` lists the unavailable model with its error until it loads again.
 
