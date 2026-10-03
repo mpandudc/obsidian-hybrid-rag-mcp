@@ -87,7 +87,20 @@ RERANK_MODEL_NAME = "jinaai/jina-reranker-v2-base-multilingual"
 MAX_CHUNKS_PER_NOTE = int(os.environ.get("VAULT_MAX_CHUNKS_PER_NOTE", "2"))
 # Cross-encoder logit floor; unset = no floor. Calibrate with `vault-eval` before enabling.
 MIN_RERANK_SCORE = _env_float("VAULT_MIN_RERANK_SCORE")
-RERANK_CHARS = int(os.environ.get("VAULT_RERANK_CHARS", str(indexer.CHUNK_CHAR_LIMIT)))
+# Cross-encoder budget: rerank cost on CPU is ~linear in candidates x characters
+# (measured on 3 vCPU: 20x1500 chars 13.4 s, 12x800 3.4 s).
+RERANK_CHARS = int(os.environ.get("VAULT_RERANK_CHARS", "800"))
+RERANK_POOL = int(os.environ.get("VAULT_RERANK_POOL", "12"))
+
+
+def _available_cpus() -> int:
+    try:
+        return len(os.sched_getaffinity(0))  # respects the container's cpuset
+    except AttributeError:
+        return os.cpu_count() or 2
+
+
+RERANK_THREADS = int(os.environ.get("VAULT_RERANK_THREADS", str(min(4, _available_cpus()))))
 READ_MAX_CHARS = int(os.environ.get("VAULT_READ_MAX_CHARS", "8000"))
 STATUS_VALUES = {s.strip().lower() for s in os.environ.get("VAULT_STATUS_VALUES", DEFAULT_STATUS_VALUES).split(",")
                  if s.strip()}
@@ -316,7 +329,7 @@ def get_reranker():
                 RERANK_MODEL_NAME,
                 cache_dir=str(FASTEMBED_CACHE_DIR),
                 local_files_only=True,
-                threads=2,
+                threads=RERANK_THREADS,
             )
     schedule_model_unload()
     return _reranker
@@ -452,7 +465,7 @@ def vault_search(query: str, limit: int = 5, mode: str = "hybrid", folder: str =
         outcome = search(
             conn, query, limit=limit, mode=mode, folder=folder, tags=tags, status=status,
             embed_fn=_embed_query, rerank_fn=_rerank, per_note=MAX_CHUNKS_PER_NOTE,
-            min_score=MIN_RERANK_SCORE, rerank_chars=RERANK_CHARS,
+            min_score=MIN_RERANK_SCORE, rerank_chars=RERANK_CHARS, rerank_pool=RERANK_POOL,
         )
     finally:
         conn.close()
