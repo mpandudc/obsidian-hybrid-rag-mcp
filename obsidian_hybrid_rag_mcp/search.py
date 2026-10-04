@@ -168,10 +168,15 @@ def search(
     rerank_fn: Callable[[str, list[str]], list[float]] | None = None,
     per_note: int = 2,
     min_score: float | None = None,
-    rerank_chars: int = 1500,
+    rerank_chars: int = 600,
+    rerank_pool: int = 8,
 ) -> SearchOutcome:
     """Run retrieval. `embed_fn(query) -> float32 blob`; `rerank_fn(query, docs) -> scores`.
-    Either may raise: semantic falls back to keyword hits, rerank falls back to RRF order."""
+    Either may raise: semantic falls back to keyword hits, rerank falls back to RRF order.
+
+    The cross-encoder dominates latency on CPU (roughly linear in candidates x characters), so
+    only the top `max(limit, rerank_pool)` RRF candidates are reranked, each cut to `rerank_chars`.
+    """
     bounds = folder_bounds(folder)
     nf_sql, nf_params = note_filter(tags, status)
     fetch_n = limit * 6  # headroom for per-note diversity
@@ -200,10 +205,11 @@ def search(
 
     reranked = False
     if mode == "hybrid" and rerank_fn is not None and ordered:
+        candidates = ordered[:max(limit, rerank_pool)]
         try:
-            docs = [f"Title: {rows[c][2]} > {rows[c][3]}\n{rows[c][4][:rerank_chars]}" for c in ordered]
+            docs = [f"Title: {rows[c][2]} > {rows[c][3]}\n{rows[c][4][:rerank_chars]}" for c in candidates]
             scores = [float(s) for s in rerank_fn(query, docs)]
-            scored = sorted(zip(ordered, scores, strict=True), key=lambda x: x[1], reverse=True)
+            scored = sorted(zip(candidates, scores, strict=True), key=lambda x: x[1], reverse=True)
             reranked = True
         except Exception:  # noqa: BLE001, S110 - reranker failure keeps the RRF order
             pass
